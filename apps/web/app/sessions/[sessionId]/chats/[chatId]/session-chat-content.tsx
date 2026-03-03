@@ -664,6 +664,7 @@ export function SessionChatContent(_props: unknown) {
   const router = useRouter();
   const {
     chats: mobileChats,
+    chatsLoading: mobileChatsLoading,
     createChat: mobileCreateChat,
     switchChat: mobileSwitchChat,
   } = useSessionLayout();
@@ -761,6 +762,7 @@ export function SessionChatContent(_props: unknown) {
     archiveSession,
     unarchiveSession,
     updateChatModel,
+    updateSessionTitle,
     hadInitialMessages,
     diff,
     refreshDiff,
@@ -962,7 +964,7 @@ export function SessionChatContent(_props: unknown) {
   const lastStatusSyncAtRef = useRef(0);
   const statusSyncInFlightRef = useRef(false);
   const pendingOptimisticTitleChatIdRef = useRef<string | null>(null);
-  const hasSetOptimisticTitleRef = useRef(false);
+  const hasRequestedSessionTitleGenerationRef = useRef(false);
   const markReadRef = useRef<{
     lastAt: number;
     lastChatId: string | null;
@@ -1044,6 +1046,10 @@ export function SessionChatContent(_props: unknown) {
   useEffect(() => {
     requestMarkChatReadRef.current = requestMarkChatRead;
   }, [requestMarkChatRead]);
+
+  useEffect(() => {
+    hasRequestedSessionTitleGenerationRef.current = false;
+  }, [session.id]);
 
   // Refresh chats list when the first message completes to pick up the auto-generated title
   useEffect(() => {
@@ -1642,7 +1648,6 @@ export function SessionChatContent(_props: unknown) {
     if (becameError && pendingOptimisticTitleChatIdRef.current) {
       void clearChatTitle(pendingOptimisticTitleChatIdRef.current);
       pendingOptimisticTitleChatIdRef.current = null;
-      hasSetOptimisticTitleRef.current = false;
     }
     if (becameReady) {
       pendingOptimisticTitleChatIdRef.current = null;
@@ -2776,17 +2781,64 @@ export function SessionChatContent(_props: unknown) {
                 setInput("");
                 clearImages();
 
+                const isFirstChatInSession =
+                  !mobileChatsLoading &&
+                  mobileChats.length === 1 &&
+                  mobileChats[0]?.id === chatInfo.id;
                 const shouldSetOptimisticTitle =
-                  !hadInitialMessages && !hasSetOptimisticTitleRef.current;
+                  isFirstChatInSession &&
+                  !hadInitialMessages &&
+                  messages.length === 0;
                 const trimmedText = messageText.trim();
+                const shouldGenerateSessionTitle =
+                  shouldSetOptimisticTitle &&
+                  trimmedText.length > 0 &&
+                  !hasRequestedSessionTitleGenerationRef.current;
                 if (shouldSetOptimisticTitle && trimmedText.length > 0) {
                   const nextTitle =
                     trimmedText.length > 30
                       ? `${trimmedText.slice(0, 30)}...`
                       : trimmedText;
-                  hasSetOptimisticTitleRef.current = true;
                   pendingOptimisticTitleChatIdRef.current = chatInfo.id;
                   void setChatTitle(chatInfo.id, nextTitle);
+
+                  if (shouldGenerateSessionTitle) {
+                    hasRequestedSessionTitleGenerationRef.current = true;
+                    // Generate a title in parallel and persist it as soon as it
+                    // resolves, without waiting for the assistant response.
+                    const generatedTitlePromise = fetch("/api/generate-title", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ message: trimmedText }),
+                    })
+                      .then(async (res) => {
+                        if (!res.ok) {
+                          return null;
+                        }
+
+                        const data = (await res.json().catch(() => null)) as {
+                          title?: unknown;
+                        } | null;
+                        if (typeof data?.title !== "string") {
+                          return null;
+                        }
+
+                        const title = data.title.trim();
+                        return title.length > 0 ? title : null;
+                      })
+                      .catch(() => null);
+
+                    void generatedTitlePromise
+                      .then((generatedTitle) => {
+                        if (!generatedTitle) {
+                          return;
+                        }
+                        return updateSessionTitle(generatedTitle);
+                      })
+                      .catch(() => {
+                        // Ignore failures and keep the existing session title.
+                      });
+                  }
                 }
                 setHasPendingResponse(true);
                 hasSeenAssistantRenderableContentRef.current = false;
@@ -2799,7 +2851,6 @@ export function SessionChatContent(_props: unknown) {
                       pendingOptimisticTitleChatIdRef.current,
                     );
                     pendingOptimisticTitleChatIdRef.current = null;
-                    hasSetOptimisticTitleRef.current = false;
                   }
                   setHasPendingResponse(false);
                   void setChatStreaming(chatInfo.id, false);
