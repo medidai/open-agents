@@ -71,7 +71,7 @@ mock.module("./client", () => ({
 const sessionsModulePromise = import("./sessions");
 
 describe("normalizeLegacySandboxState", () => {
-  test("rewrites leftover legacy hybrid state to vercel while preserving fields", async () => {
+  test("rewrites legacy vercel-compatible sandbox ids onto sandboxName", async () => {
     const { normalizeLegacySandboxState } = await sessionsModulePromise;
 
     const result = normalizeLegacySandboxState({
@@ -83,9 +83,25 @@ describe("normalizeLegacySandboxState", () => {
 
     expect(result).toEqual({
       type: "vercel",
-      sandboxId: "sbx-legacy-1",
+      sandboxName: "sbx-legacy-1",
       snapshotId: "snap-legacy-1",
       expiresAt: 123,
+    });
+  });
+
+  test("moves persisted session_<id> identifiers onto sandboxName", async () => {
+    const { normalizeLegacySandboxState } = await sessionsModulePromise;
+
+    expect(
+      normalizeLegacySandboxState({
+        type: "vercel",
+        sandboxId: "session_123",
+        expiresAt: 456,
+      }),
+    ).toEqual({
+      type: "vercel",
+      sandboxName: "session_123",
+      expiresAt: 456,
     });
   });
 
@@ -94,7 +110,7 @@ describe("normalizeLegacySandboxState", () => {
 
     const state = {
       type: "vercel",
-      sandboxId: "sbx-current-1",
+      sandboxName: "session_current-1",
       expiresAt: 456,
     } as const;
 

@@ -21,7 +21,22 @@ type MockRunCommandParams = {
   env?: Record<string, string>;
 };
 
+type MockSessionState = {
+  sessionId?: string;
+  status?:
+    | "running"
+    | "stopped"
+    | "stopping"
+    | "snapshotting"
+    | "aborted"
+    | "failed";
+  timeout?: number;
+  requestedAt?: Date;
+  startedAt?: Date;
+};
+
 const createCalls: Array<Record<string, unknown>> = [];
+const getCalls: Array<Record<string, unknown>> = [];
 const runCommandCalls: MockRunCommandParams[] = [];
 const writeFilesCalls: Array<{ path: string; content: Buffer }[]> = [];
 let readFileToBufferResult: Buffer | null = Buffer.from("");
@@ -34,6 +49,7 @@ let runCommandMock = async (
   stdout: async () => "",
 });
 let lastRunCommandEnv: Record<string, string> | undefined;
+let currentSessionStateFactory = (_name: string): MockSessionState => ({});
 
 function domainForPort(port: number): string {
   if (missingPorts.has(port)) {
@@ -48,55 +64,82 @@ function domainForPort(port: number): string {
   return domain;
 }
 
+function buildRoutes() {
+  return Array.from(portDomains.keys()).map((port) => {
+    const domain = portDomains.get(port) ?? `https://sbx-${port}.vercel.run`;
+    const subdomain = new URL(domain).host.replace(".vercel.run", "");
+    return { port, subdomain };
+  });
+}
+
+function buildMockSession(name: string, state: MockSessionState = {}) {
+  return {
+    sessionId: state.sessionId ?? `${name}-session`,
+    status: state.status ?? "running",
+    timeout: state.timeout ?? 300_000,
+    requestedAt: state.requestedAt ?? new Date(),
+    startedAt: state.startedAt ?? new Date(),
+    routes: buildRoutes(),
+    domain: (port: number) => domainForPort(port),
+    runCommand: async (params: MockRunCommandParams) => {
+      runCommandCalls.push(params);
+      lastRunCommandEnv = params.env;
+      return runCommandMock(params);
+    },
+    writeFiles: async (files: { path: string; content: Buffer }[]) => {
+      writeFilesCalls.push(files);
+    },
+    readFileToBuffer: async (_opts: { path: string }) => {
+      return readFileToBufferResult;
+    },
+    snapshot: async () => ({ snapshotId: "snap-created" }),
+    stop: async () => {},
+    extendTimeout: async () => {},
+  };
+}
+
+function createMockSandboxSdk(name: string) {
+  let session = buildMockSession(name, currentSessionStateFactory(name));
+
+  return {
+    name,
+    get routes() {
+      return buildRoutes();
+    },
+    domain: (port: number) => domainForPort(port),
+    currentSession: () => {
+      session = buildMockSession(name, currentSessionStateFactory(name));
+      return session;
+    },
+    runCommand: async (params: MockRunCommandParams) => {
+      runCommandCalls.push(params);
+      lastRunCommandEnv = params.env;
+      return runCommandMock(params);
+    },
+    writeFiles: async (files: { path: string; content: Buffer }[]) => {
+      writeFilesCalls.push(files);
+    },
+    readFileToBuffer: async (_opts: { path: string }) => {
+      return readFileToBufferResult;
+    },
+    stop: async () => {},
+  };
+}
+
 mock.module("@vercel/sandbox", () => ({
   Sandbox: {
     create: async (params: Record<string, unknown>) => {
       createCalls.push(params);
-      return {
-        sandboxId: "sbx-created",
-        routes: Array.from(portDomains.keys()).map((port) => {
-          const domain =
-            portDomains.get(port) ?? `https://sbx-${port}.vercel.run`;
-          const subdomain = new URL(domain).host.replace(".vercel.run", "");
-          return { port, subdomain };
-        }),
-        domain: (port: number) => domainForPort(port),
-        runCommand: async (params: MockRunCommandParams) => {
-          runCommandCalls.push(params);
-          lastRunCommandEnv = params.env;
-          return runCommandMock(params);
-        },
-        writeFiles: async (files: { path: string; content: Buffer }[]) => {
-          writeFilesCalls.push(files);
-        },
-        readFileToBuffer: async (_opts: { path: string }) => {
-          return readFileToBufferResult;
-        },
-        stop: async () => {},
-      };
+      return createMockSandboxSdk(
+        typeof params.name === "string" ? params.name : "generated-sandbox",
+      );
     },
-    get: async ({ sandboxId }: { sandboxId: string }) => ({
-      sandboxId,
-      routes: Array.from(portDomains.keys()).map((port) => {
-        const domain =
-          portDomains.get(port) ?? `https://sbx-${port}.vercel.run`;
-        const subdomain = new URL(domain).host.replace(".vercel.run", "");
-        return { port, subdomain };
-      }),
-      domain: (port: number) => domainForPort(port),
-      runCommand: async (params: MockRunCommandParams) => {
-        runCommandCalls.push(params);
-        lastRunCommandEnv = params.env;
-        return runCommandMock(params);
-      },
-      writeFiles: async (files: { path: string; content: Buffer }[]) => {
-        writeFilesCalls.push(files);
-      },
-      readFileToBuffer: async (_opts: { path: string }) => {
-        return readFileToBufferResult;
-      },
-      stop: async () => {},
-    }),
+    get: async (params: Record<string, unknown>) => {
+      getCalls.push(params);
+      const sandboxName =
+        typeof params.name === "string" ? params.name : "loaded-sandbox";
+      return createMockSandboxSdk(sandboxName);
+    },
   },
 }));
 
@@ -108,6 +151,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   createCalls.length = 0;
+  getCalls.length = 0;
   runCommandCalls.length = 0;
   writeFilesCalls.length = 0;
   readFileToBufferResult = Buffer.from("");
@@ -120,6 +164,7 @@ beforeEach(() => {
     stdout: async () => "",
   });
   lastRunCommandEnv = undefined;
+  currentSessionStateFactory = () => ({});
 });
 
 describe("VercelSandbox.environmentDetails", () => {
@@ -196,6 +241,94 @@ describe("VercelSandbox.environmentDetails", () => {
     expect(lastRunCommandEnv?.SANDBOX_URL_3000).toBe(
       "https://sbx-3000.vercel.run",
     );
+  });
+});
+
+describe("VercelSandbox persistence", () => {
+  test("connects by persistent sandbox name without auto-resume by default", async () => {
+    const sandbox = await sandboxModule.VercelSandbox.connect("session_123", {
+      remainingTimeout: 0,
+    });
+
+    expect(getCalls[0]).toEqual({ name: "session_123", resume: false });
+    expect(sandbox.getState()).toEqual(
+      expect.objectContaining({
+        type: "vercel",
+        sandboxName: "session_123",
+      }),
+    );
+  });
+
+  test("persists sandboxName in state for created sandboxes", async () => {
+    const sandbox = await sandboxModule.VercelSandbox.create({
+      name: "session_123",
+    });
+
+    expect(createCalls[0]).toEqual(
+      expect.objectContaining({
+        name: "session_123",
+        persistent: true,
+      }),
+    );
+    expect(sandbox.getState()).toEqual(
+      expect.objectContaining({
+        type: "vercel",
+        sandboxName: "session_123",
+      }),
+    );
+  });
+
+  test("derives resumed expiresAt without the provider stop buffer", async () => {
+    const startedAt = new Date();
+    currentSessionStateFactory = () => ({
+      timeout: 330_000,
+      requestedAt: startedAt,
+      startedAt,
+    });
+
+    const before = Date.now();
+    const sandbox = await sandboxModule.VercelSandbox.connect("session_123");
+    const remaining = (sandbox.expiresAt ?? 0) - before;
+
+    expect(remaining).toBeGreaterThan(298_000);
+    expect(remaining).toBeLessThanOrEqual(300_000);
+  });
+
+  test("refreshes state when the current session changes from stopped to running", async () => {
+    const stoppedAt = new Date(Date.now() - 60_000);
+    currentSessionStateFactory = () => ({
+      sessionId: "session_123-stopped",
+      status: "stopped",
+      timeout: 330_000,
+      requestedAt: stoppedAt,
+      startedAt: stoppedAt,
+    });
+
+    const sandbox = await sandboxModule.VercelSandbox.connect("session_123");
+    expect(sandbox.status).toBe("stopped");
+
+    const resumedAt = new Date();
+    currentSessionStateFactory = () => ({
+      sessionId: "session_123-running",
+      status: "running",
+      timeout: 330_000,
+      requestedAt: resumedAt,
+      startedAt: resumedAt,
+    });
+
+    const state = sandbox.getState();
+    const remaining = (state.expiresAt ?? 0) - Date.now();
+
+    expect(sandbox.status).toBe("ready");
+    expect(state).toEqual(
+      expect.objectContaining({
+        type: "vercel",
+        sandboxName: "session_123",
+        expiresAt: expect.any(Number),
+      }),
+    );
+    expect(remaining).toBeGreaterThan(298_000);
+    expect(remaining).toBeLessThanOrEqual(300_000);
   });
 });
 
