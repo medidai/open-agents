@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Logo } from "./logo";
 
 export function LandingNav() {
   const [scrolled, setScrolled] = useState(false);
@@ -22,31 +23,7 @@ export function LandingNav() {
               : "border-x-transparent border-b-transparent bg-transparent"
           }`}
         >
-          <div className="flex items-center gap-2.5">
-            <svg
-              viewBox="0 0 24 24"
-              className="size-5"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M4 17L10 11L4 5"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <path
-                d="M12 19H20"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-            </svg>
-            <span className="text-sm font-semibold tracking-tight">
-              Open Agents
-            </span>
-          </div>
+          <Logo className="h-[17px]" />
 
           <div className="flex items-center gap-6">
             <a
