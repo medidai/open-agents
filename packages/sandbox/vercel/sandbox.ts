@@ -88,7 +88,9 @@ async function syncGitHubCredentialBrokering(
 ): Promise<void> {
   const updateNetworkPolicy = (
     sdk as VercelSandboxSDK & {
-      updateNetworkPolicy?: (policy: SandboxNetworkPolicy) => Promise<void>;
+      updateNetworkPolicy?: (
+        policy: SandboxNetworkPolicy | "allow-all",
+      ) => Promise<void>;
     }
   ).updateNetworkPolicy;
 
@@ -101,10 +103,9 @@ async function syncGitHubCredentialBrokering(
     return;
   }
 
-  await updateNetworkPolicy.call(
-    sdk,
-    buildGitHubCredentialBrokeringPolicy(token),
-  );
+  // Switch to allow-all so non-TLS protocols (Postgres, Redis) work.
+  // Git auth is handled via tokens embedded in the remote URL.
+  await updateNetworkPolicy.call(sdk, "allow-all");
 }
 
 function buildAuthenticatedGitHubUrl(
