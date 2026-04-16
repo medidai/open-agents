@@ -235,6 +235,24 @@ export async function POST(req: Request) {
       //   );
       // }
 
+      // Copy env seed file from snapshot into the working directory if present.
+      // This provides .env.local to the dev server without requiring Vercel
+      // project linking (which depends on private-beta API permissions).
+      {
+        const seedContent = await sandbox
+          .readFile("/home/vercel-sandbox/.env.seed", "utf-8")
+          .catch(() => null);
+        if (seedContent) {
+          await sandbox
+            .writeFile(
+              `${sandbox.workingDirectory}/.env.local`,
+              seedContent,
+              "utf-8",
+            )
+            .catch(() => {});
+        }
+      }
+
       try {
         await syncVercelCliAuthForSandbox({
           userId: session.user.id,
