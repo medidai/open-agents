@@ -239,9 +239,17 @@ export async function POST(req: Request) {
       // This provides .env.local to the dev server without requiring Vercel
       // project linking (which depends on private-beta API permissions).
       {
-        const seedContent = await sandbox
+        let seedContent = await sandbox
           .readFile("/home/vercel-sandbox/.env.seed", "utf-8")
           .catch(() => null);
+        if (seedContent && sandbox.domain) {
+          // Replace localhost redirect URIs with the sandbox's public URL.
+          const sandboxOrigin = sandbox.domain(5173).replace(/\/$/, "");
+          seedContent = seedContent.replace(
+            /^(WORKOS_REDIRECT_URI=).*$/m,
+            `$1${sandboxOrigin}/api/auth/callback`,
+          );
+        }
         if (seedContent) {
           await sandbox
             .writeFile(
