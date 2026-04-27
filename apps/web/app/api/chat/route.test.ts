@@ -38,16 +38,30 @@ let existingChatMessage: { id: string } | null = null;
 let isSandboxActive = true;
 let existingRunStatus: string = "completed";
 let getRunShouldThrow = false;
+let claimActiveStreamDefaultResult = true;
 let compareAndSetDefaultResult = true;
 let compareAndSetResults: boolean[] = [];
 let startCalls: unknown[][] = [];
-let preferencesState = {
+let preferencesState: {
+  autoCommitPush: boolean;
+  autoCreatePr: boolean;
+  modelVariants: Array<{
+    id: string;
+    name: string;
+    baseModelId: string;
+    providerOptions: Record<string, unknown>;
+  }>;
+} = {
   autoCommitPush: true,
   autoCreatePr: false,
   modelVariants: [],
 };
 let cachedSkillsState: unknown = null;
 let discoverSkillDirsCalls: string[][] = [];
+
+const claimChatActiveStreamIdSpy = mock(
+  async () => claimActiveStreamDefaultResult,
+);
 
 const compareAndSetChatActiveStreamIdSpy = mock(async () => {
   const nextResult = compareAndSetResults.shift();
@@ -120,7 +134,7 @@ mock.module("@/lib/chat/create-cancelable-readable-stream", () => ({
   createCancelableReadableStream: (stream: ReadableStream) => stream,
 }));
 
-mock.module("@open-harness/agent", () => ({
+mock.module("@open-agents/agent", () => ({
   discoverSkills: async (_sandbox: unknown, skillDirs: string[]) => {
     discoverSkillDirsCalls.push(skillDirs);
     return [];
@@ -128,7 +142,7 @@ mock.module("@open-harness/agent", () => ({
   gateway: () => "mock-model",
 }));
 
-mock.module("@open-harness/sandbox", () => ({
+mock.module("@open-agents/sandbox", () => ({
   connectSandbox: async () => ({
     workingDirectory: "/vercel/sandbox",
     exec: async () => ({ success: true, stdout: "", stderr: "" }),
@@ -150,6 +164,7 @@ mock.module("./_lib/persist-tool-results", () => ({
 }));
 
 mock.module("@/lib/db/sessions", () => ({
+  claimChatActiveStreamId: claimChatActiveStreamIdSpy,
   compareAndSetChatActiveStreamId: compareAndSetChatActiveStreamIdSpy,
   countUserMessagesByUserId: async () => existingUserMessageCount,
   createChatMessageIfNotExists: async () => undefined,
@@ -175,20 +190,12 @@ mock.module("@/lib/skills-cache", () => ({
   setCachedSkills: async () => {},
 }));
 
-mock.module("@/lib/github/user-token", () => ({
+mock.module("@/lib/github/token", () => ({
   getUserGitHubToken: async () => null,
 }));
 
 mock.module("@/lib/sandbox/config", () => ({
   DEFAULT_SANDBOX_PORTS: [],
-}));
-
-mock.module("@/lib/sandbox/vercel-cli-auth", () => ({
-  getVercelCliSandboxSetup: async () => ({
-    auth: null,
-    projectLink: null,
-  }),
-  syncVercelCliAuthToSandbox: async () => {},
 }));
 
 mock.module("@/lib/sandbox/lifecycle", () => ({
@@ -241,6 +248,7 @@ describe("/api/chat route", () => {
     isSandboxActive = true;
     existingRunStatus = "completed";
     getRunShouldThrow = false;
+    claimActiveStreamDefaultResult = true;
     compareAndSetDefaultResult = true;
     compareAndSetResults = [];
     startCalls = [];
@@ -253,6 +261,7 @@ describe("/api/chat route", () => {
       autoCreatePr: false,
       modelVariants: [],
     };
+    claimChatActiveStreamIdSpy.mockClear();
     compareAndSetChatActiveStreamIdSpy.mockClear();
     persistAssistantMessagesWithToolResultsSpy.mockClear();
     currentAuthSession = {
@@ -340,6 +349,34 @@ describe("/api/chat route", () => {
         agentOptions: expect.objectContaining({
           customInstructions: assistantFileLinkPrompt,
         }),
+      }),
+    ]);
+  });
+
+  test("passes selected and resolved model ids to the workflow", async () => {
+    const { POST } = await routeModulePromise;
+    if (!chatRecord) {
+      throw new Error("chatRecord must be set");
+    }
+
+    chatRecord.modelId = "variant:test-model";
+    preferencesState.modelVariants = [
+      {
+        id: "variant:test-model",
+        name: "Test model",
+        baseModelId: "openai/gpt-5",
+        providerOptions: {},
+      },
+    ];
+
+    const response = await POST(createValidRequest());
+
+    expect(response.ok).toBe(true);
+    expect(startCalls).toHaveLength(1);
+    expect(startCalls[0]?.[1]).toEqual([
+      expect.objectContaining({
+        selectedModelId: "variant:test-model",
+        modelId: "openai/gpt-5",
       }),
     ]);
   });
@@ -526,10 +563,11 @@ describe("/api/chat route", () => {
 
     const compareAndSetCalls = compareAndSetChatActiveStreamIdSpy.mock
       .calls as unknown[][];
-    expect(compareAndSetCalls).toEqual([
-      ["chat-1", "wrun_old-789", null],
-      ["chat-1", null, "wrun_test-123"],
-    ]);
+    expect(compareAndSetCalls).toEqual([["chat-1", "wrun_old-789", null]]);
+    expect(claimChatActiveStreamIdSpy).toHaveBeenCalledWith(
+      "chat-1",
+      "wrun_test-123",
+    );
   });
 
   test("starts new workflow when the existing run cannot be loaded and clears the stale stream id first", async () => {
@@ -546,14 +584,28 @@ describe("/api/chat route", () => {
 
     const compareAndSetCalls = compareAndSetChatActiveStreamIdSpy.mock
       .calls as unknown[][];
-    expect(compareAndSetCalls).toEqual([
-      ["chat-1", "wrun_missing-789", null],
-      ["chat-1", null, "wrun_test-123"],
-    ]);
+    expect(compareAndSetCalls).toEqual([["chat-1", "wrun_missing-789", null]]);
+    expect(claimChatActiveStreamIdSpy).toHaveBeenCalledWith(
+      "chat-1",
+      "wrun_test-123",
+    );
   });
 
-  test("returns 409 when CAS race is lost", async () => {
+  test("succeeds when the started workflow already claimed the stream slot", async () => {
     compareAndSetDefaultResult = false;
+    const { POST } = await routeModulePromise;
+
+    const response = await POST(createValidRequest());
+
+    expect(response.ok).toBe(true);
+    expect(claimChatActiveStreamIdSpy).toHaveBeenCalledWith(
+      "chat-1",
+      "wrun_test-123",
+    );
+  });
+
+  test("returns 409 when a different workflow owns the stream slot", async () => {
+    claimActiveStreamDefaultResult = false;
     const { POST } = await routeModulePromise;
 
     const response = await POST(createValidRequest());

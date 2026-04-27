@@ -18,6 +18,7 @@ import {
   SquareDot,
   SquareMinus,
   SquarePlus,
+  Trash2,
   WandSparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -31,9 +32,18 @@ import type {
   PullRequestMergeMethod,
 } from "@/lib/github/client";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -48,19 +58,23 @@ import {
 import { CheckRunsList } from "@/components/merge-check-runs";
 import {
   MERGE_READINESS_POLL_INTERVAL_MS,
+  shouldIncrementMergeReadinessTransientPollCount,
   shouldPollMergeReadiness,
 } from "@/lib/merge-readiness-polling";
 import { cn } from "@/lib/utils";
 import {
   commitAndPushSessionChanges,
   createSessionBranch,
+  discardSessionUncommittedChanges,
   fetchRepoBranches,
   generatePullRequestContent,
 } from "@/lib/git-flow-client";
 import type { SessionGitStatus } from "@/hooks/use-session-git-status";
 import { useSessionFiles } from "@/hooks/use-session-files";
+import { useGitHubConnectionStatus } from "@/hooks/use-github-connection-status";
 import { useGitPanel } from "./git-panel-context";
 import { FileTree } from "./file-tree";
+import { useSessionChatWorkspaceContext } from "./session-chat-context";
 
 /* ------------------------------------------------------------------ */
 /* Merge method labels / descriptions                                  */
@@ -160,7 +174,21 @@ function isUncommittedFile(file: DiffFile): boolean {
   return file.stagingStatus === "unstaged" || file.stagingStatus === "partial";
 }
 
-function DiffFileList({ files }: { files: DiffFile[] }) {
+function canDiscardFile(file: DiffFile): boolean {
+  return isUncommittedFile(file);
+}
+
+function DiffFileList({
+  files,
+  onDiscardFile,
+  discardingFilePath,
+  discardDisabled,
+}: {
+  files: DiffFile[];
+  onDiscardFile: (file: DiffFile) => void;
+  discardingFilePath: string | null;
+  discardDisabled: boolean;
+}) {
   const { openDiffToFile, diffScope } = useGitPanel();
 
   const filteredFiles =
@@ -186,44 +214,99 @@ function DiffFileList({ files }: { files: DiffFile[] }) {
           const dirPath = file.path.slice(0, -fileName.length);
 
           return (
-            <button
+            <div
               key={file.path}
-              type="button"
-              onClick={() => openDiffToFile(file.path)}
-              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+              className="group flex items-center gap-1 rounded-md px-2 py-1.5 transition-colors hover:bg-accent"
             >
-              <DiffFileStatusIcon status={file.status} />
-              <div className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
-                <span className="shrink-0 text-xs font-medium text-foreground font-mono">
-                  {fileName}
-                </span>
-                {dirPath && (
-                  <span
-                    className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground"
-                    dir="rtl"
-                  >
-                    <bdi>{dirPath.replace(/\/$/, "")}</bdi>
+              <button
+                type="button"
+                onClick={() => openDiffToFile(file.path)}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              >
+                <DiffFileStatusIcon status={file.status} />
+                <div className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
+                  <span className="shrink-0 font-mono text-xs font-medium text-foreground">
+                    {fileName}
                   </span>
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-1.5 text-[10px]">
-                {file.additions > 0 && (
-                  <span className="text-green-600 dark:text-green-500">
-                    +{file.additions}
-                  </span>
-                )}
-                {file.deletions > 0 && (
-                  <span className="text-red-600 dark:text-red-400">
-                    -{file.deletions}
-                  </span>
-                )}
-              </div>
-            </button>
+                  {dirPath && (
+                    <span
+                      className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-muted-foreground"
+                      dir="rtl"
+                    >
+                      <bdi>{dirPath.replace(/\/$/, "")}</bdi>
+                    </span>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5 text-[10px]">
+                  {file.additions > 0 && (
+                    <span className="text-green-600 dark:text-green-500">
+                      +{file.additions}
+                    </span>
+                  )}
+                  {file.deletions > 0 && (
+                    <span className="text-red-600 dark:text-red-400">
+                      -{file.deletions}
+                    </span>
+                  )}
+                </div>
+              </button>
+              {canDiscardFile(file) ? (
+                <button
+                  type="button"
+                  onClick={() => onDiscardFile(file)}
+                  disabled={discardDisabled || discardingFilePath === file.path}
+                  aria-label={`Discard changes in ${file.path}`}
+                  className="rounded p-1 text-muted-foreground opacity-0 transition hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-100"
+                >
+                  {discardingFilePath === file.path ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              ) : null}
+            </div>
           );
         })}
       </div>
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* GitHub connection warning banner                                     */
+/* ------------------------------------------------------------------ */
+
+function GitHubConnectionWarning({
+  status,
+  reconnectRequired,
+}: {
+  status: string | null;
+  reconnectRequired: boolean;
+}) {
+  if (reconnectRequired) {
+    return (
+      <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-400">
+        Your GitHub connection needs to be refreshed.{" "}
+        {/* oxlint-disable-next-line nextjs/no-html-link-for-pages */}
+        <a href="/settings/connections" className="underline">
+          Reconnect
+        </a>
+      </div>
+    );
+  }
+  if (status === "not_connected") {
+    return (
+      <div className="rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
+        Connect GitHub to push changes.{" "}
+        {/* oxlint-disable-next-line nextjs/no-html-link-for-pages */}
+        <a href="/settings/connections" className="underline">
+          Go to settings
+        </a>
+      </div>
+    );
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,6 +321,8 @@ function InlineCommitPanel({
   onCommitted,
   isAgentWorking,
   baseBranch,
+  connectionStatus,
+  reconnectRequired,
 }: {
   session: Session;
   hasSandbox: boolean;
@@ -246,6 +331,8 @@ function InlineCommitPanel({
   onCommitted?: () => void;
   isAgentWorking: boolean;
   baseBranch: string;
+  connectionStatus: string | null;
+  reconnectRequired: boolean;
 }) {
   const [commitMessage, setCommitMessage] = useState("");
   const [isCommitting, setIsCommitting] = useState(false);
@@ -381,6 +468,10 @@ function InlineCommitPanel({
   if (needsNewBranch) {
     return (
       <div className="space-y-2">
+        <GitHubConnectionWarning
+          status={connectionStatus}
+          reconnectRequired={reconnectRequired}
+        />
         <div className="rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
           {isDetachedHead
             ? "Detached HEAD — create a branch first."
@@ -424,6 +515,10 @@ function InlineCommitPanel({
   // Commit form
   const commitForm = (
     <div className="space-y-2">
+      <GitHubConnectionWarning
+        status={connectionStatus}
+        reconnectRequired={reconnectRequired}
+      />
       {isExpanded && (
         <div className="relative">
           <Textarea
@@ -554,6 +649,8 @@ function InlinePrCreatePanel({
   onGitMessage,
   isAgentWorking,
   baseBranch,
+  connectionStatus,
+  reconnectRequired,
 }: {
   session: Session;
   hasSandbox: boolean;
@@ -567,6 +664,8 @@ function InlinePrCreatePanel({
   onGitMessage?: (message: WebAgentUIMessage) => Promise<void> | void;
   isAgentWorking: boolean;
   baseBranch: string;
+  connectionStatus: string | null;
+  reconnectRequired: boolean;
 }) {
   const [prTitle, setPrTitle] = useState("");
   const [prBody, setPrBody] = useState("");
@@ -582,7 +681,6 @@ function InlinePrCreatePanel({
   const [isCreatingBranch, setIsCreatingBranch] = useState(false);
   const [resolvedBranch, setResolvedBranch] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [prHeadOwner, setPrHeadOwner] = useState<string | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [enableAutoMerge, setEnableAutoMerge] = useState(false);
 
@@ -595,21 +693,6 @@ function InlinePrCreatePanel({
   const displayBranch = currentBranch === "HEAD" ? baseBranch : currentBranch;
   const isDetachedHead = gitStatus?.isDetachedHead ?? false;
   const needsNewBranch = displayBranch === baseBranch || isDetachedHead;
-
-  const normalizedRepoOwner = session.repoOwner?.toLowerCase() ?? null;
-  const normalizedHeadOwner = prHeadOwner?.toLowerCase() ?? null;
-  const shouldOpenCompareInsteadOfApi = Boolean(
-    normalizedRepoOwner &&
-    normalizedHeadOwner &&
-    normalizedHeadOwner !== normalizedRepoOwner,
-  );
-  const canEnableAutoMerge = !shouldOpenCompareInsteadOfApi;
-
-  useEffect(() => {
-    if (!canEnableAutoMerge) {
-      setEnableAutoMerge(false);
-    }
-  }, [canEnableAutoMerge]);
 
   const handleCreateBranch = async () => {
     if (!hasSandbox) return;
@@ -650,9 +733,6 @@ function InlinePrCreatePanel({
       });
       setPrTitle(generated.title ?? session.title);
       setPrBody(generated.body ?? "");
-      if (generated.prHeadOwner) {
-        setPrHeadOwner(generated.prHeadOwner);
-      }
       if (generated.branchName && generated.branchName !== "HEAD") {
         setResolvedBranch(generated.branchName);
       }
@@ -686,9 +766,6 @@ function InlinePrCreatePanel({
           });
           finalTitle = generated.title ?? session.title;
           finalBody = finalBody || (generated.body ?? "");
-          if (generated.prHeadOwner) {
-            setPrHeadOwner(generated.prHeadOwner);
-          }
           if (generated.branchName && generated.branchName !== "HEAD") {
             setResolvedBranch(generated.branchName);
           }
@@ -711,45 +788,6 @@ function InlinePrCreatePanel({
         ],
       });
 
-      // Check if we need to open compare page instead
-      const headOwner = prHeadOwner?.trim() || session.repoOwner;
-      const ownerMismatch =
-        headOwner &&
-        session.repoOwner &&
-        headOwner.toLowerCase() !== session.repoOwner.toLowerCase();
-
-      if (ownerMismatch && session.repoOwner && session.repoName) {
-        const headRef = `${headOwner}:${displayBranch}`;
-        const compareUrl = new URL(
-          `https://github.com/${session.repoOwner}/${session.repoName}/compare/${encodeURIComponent(baseBranch)}...${encodeURIComponent(headRef)}`,
-        );
-        compareUrl.searchParams.set("expand", "1");
-        if (finalTitle) compareUrl.searchParams.set("title", finalTitle);
-        if (finalBody) compareUrl.searchParams.set("body", finalBody);
-        window.open(compareUrl.toString(), "_blank", "noopener,noreferrer");
-        setPrSuccess({
-          prUrl: compareUrl.toString(),
-          requiresManualCreation: true,
-        });
-        await onGitMessage?.({
-          id: gitMessageId,
-          role: "assistant",
-          metadata: {},
-          parts: [
-            {
-              type: "data-pr",
-              id: prPartId,
-              data: {
-                status: "success",
-                url: compareUrl.toString(),
-                requiresManualCreation: true,
-              },
-            },
-          ],
-        });
-        return;
-      }
-
       const res = await fetch("/api/pr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -760,7 +798,6 @@ function InlinePrCreatePanel({
           title: finalTitle,
           body: finalBody,
           baseBranch,
-          headOwner: prHeadOwner ?? undefined,
           isDraft,
           enableAutoMerge: !isDraft && enableAutoMerge,
         }),
@@ -882,6 +919,10 @@ function InlinePrCreatePanel({
 
     const branchContent = (
       <div className="space-y-2">
+        <GitHubConnectionWarning
+          status={connectionStatus}
+          reconnectRequired={reconnectRequired}
+        />
         <div className="rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
           {isDetachedHead
             ? "Detached HEAD — create a branch first."
@@ -947,6 +988,10 @@ function InlinePrCreatePanel({
   // PR creation form
   const prForm = (
     <div className="space-y-2">
+      <GitHubConnectionWarning
+        status={connectionStatus}
+        reconnectRequired={reconnectRequired}
+      />
       {isExpanded && (
         <>
           <div className="relative">
@@ -982,15 +1027,13 @@ function InlinePrCreatePanel({
             <div className="space-y-0.5 pr-3">
               <p className="text-xs font-medium">Auto-merge</p>
               <p className="text-[10px] text-muted-foreground">
-                {shouldOpenCompareInsteadOfApi
-                  ? "Unavailable for compare page flow."
-                  : "Merge automatically once checks pass."}
+                Merge automatically once checks pass.
               </p>
             </div>
             <Switch
               checked={enableAutoMerge}
               onCheckedChange={setEnableAutoMerge}
-              disabled={isAgentWorking || isCreatingPr || !canEnableAutoMerge}
+              disabled={isAgentWorking || isCreatingPr}
             />
           </div>
         </>
@@ -1102,7 +1145,7 @@ function InlineMergePanel({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [forceConfirming, setForceConfirming] = useState(false);
-  const [emptyChecksPollCount, setEmptyChecksPollCount] = useState(0);
+  const [transientPollCount, setTransientPollCount] = useState(0);
 
   const readinessRequestIdRef = useRef(0);
   const forceConfirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -1163,7 +1206,7 @@ function InlineMergePanel({
   }, [session.id]);
 
   useEffect(() => {
-    setEmptyChecksPollCount(0);
+    setTransientPollCount(0);
   }, [session.prNumber]);
 
   // Load readiness on mount
@@ -1175,21 +1218,22 @@ function InlineMergePanel({
   }, [loadReadiness]);
 
   useEffect(() => {
+    if (!shouldIncrementMergeReadinessTransientPollCount(readiness)) {
+      setTransientPollCount(0);
+    }
+  }, [readiness]);
+
+  useEffect(() => {
     if (
       isLoadingReadiness ||
-      !shouldPollMergeReadiness({ readiness, emptyChecksPollCount })
+      !shouldPollMergeReadiness({ readiness, transientPollCount })
     ) {
       return;
     }
 
     const timeoutId = window.setTimeout(() => {
-      if (
-        readiness &&
-        readiness.checks.pending === 0 &&
-        readiness.checks.requiredTotal === 0 &&
-        readiness.checkRuns.length === 0
-      ) {
-        setEmptyChecksPollCount((currentCount) => currentCount + 1);
+      if (shouldIncrementMergeReadinessTransientPollCount(readiness)) {
+        setTransientPollCount((currentCount) => currentCount + 1);
       }
       void loadReadiness();
     }, MERGE_READINESS_POLL_INTERVAL_MS);
@@ -1197,7 +1241,7 @@ function InlineMergePanel({
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [emptyChecksPollCount, isLoadingReadiness, loadReadiness, readiness]);
+  }, [isLoadingReadiness, loadReadiness, readiness, transientPollCount]);
 
   // Cleanup timeout on unmount
   useEffect(() => {
@@ -1648,7 +1692,47 @@ export function GitPanel(props: GitPanelProps) {
     onGitMessage,
     isAgentWorking,
   } = props;
+  const { refreshFiles } = useSessionChatWorkspaceContext();
+  const { status: connectionStatus, reconnectRequired } =
+    useGitHubConnectionStatus({ enabled: hasRepo });
   const [baseBranch, setBaseBranch] = useState("main");
+  const [discardDialogOpen, setDiscardDialogOpen] = useState(false);
+  const [discardTarget, setDiscardTarget] = useState<{
+    filePath: string;
+    oldPath?: string;
+  } | null>(null);
+  const [discardError, setDiscardError] = useState<string | null>(null);
+  const [isDiscardingChanges, setIsDiscardingChanges] = useState(false);
+
+  const handleDiscardChanges = useCallback(async () => {
+    setIsDiscardingChanges(true);
+    setDiscardError(null);
+
+    try {
+      await discardSessionUncommittedChanges({
+        sessionId: session.id,
+        ...(discardTarget ? { filePath: discardTarget.filePath } : {}),
+        ...(discardTarget?.oldPath ? { oldPath: discardTarget.oldPath } : {}),
+      });
+    } catch (error) {
+      setDiscardError(
+        error instanceof Error
+          ? error.message
+          : "Failed to discard uncommitted changes",
+      );
+      setIsDiscardingChanges(false);
+      return;
+    }
+
+    await Promise.allSettled([
+      refreshDiff(),
+      refreshGitStatus(),
+      refreshFiles(),
+    ]);
+    setDiscardDialogOpen(false);
+    setDiscardTarget(null);
+    setIsDiscardingChanges(false);
+  }, [discardTarget, refreshDiff, refreshFiles, refreshGitStatus, session.id]);
 
   useEffect(() => {
     if (!session.repoOwner || !session.repoName) {
@@ -1720,6 +1804,13 @@ export function GitPanel(props: GitPanelProps) {
     }
   }, [gitPanelTab, prTabDisabledReason, setGitPanelTab]);
 
+  const discardTitle = discardTarget
+    ? "Discard file changes?"
+    : "Discard uncommitted changes?";
+  const discardDescription = discardTarget
+    ? `This permanently removes local changes for ${discardTarget.filePath}. Committed changes stay intact.`
+    : "This permanently removes local uncommitted changes from the sandbox. Committed changes stay intact.";
+  const discardingFilePath = discardTarget?.filePath ?? null;
   const gitPanelTabs = [
     "files" as const,
     "diff" as const,
@@ -1848,21 +1939,28 @@ export function GitPanel(props: GitPanelProps) {
         )}
       >
         {gitPanelTab === "files" && (
-          <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+          <div className="min-h-0 flex-1 overflow-y-auto">
             {filesLoading ? (
-              <div className="flex w-full flex-col items-center gap-1.5 rounded-lg border border-dashed border-muted-foreground/25 py-8 text-center">
-                <p className="text-xs text-muted-foreground">Loading files…</p>
+              <div className="p-3">
+                <div className="flex w-full flex-col items-center gap-1.5 rounded-lg border border-dashed border-muted-foreground/25 py-8 text-center">
+                  <p className="text-xs text-muted-foreground">
+                    Loading files…
+                  </p>
+                </div>
               </div>
             ) : sessionFiles && sessionFiles.length > 0 ? (
               <FileTree
                 files={sessionFiles}
+                repoName={session.repoName}
                 onFileClick={(filePath) => openFileTab(filePath)}
               />
             ) : (
-              <div className="flex w-full flex-col items-center gap-1.5 rounded-lg border border-dashed border-muted-foreground/25 py-8 text-center">
-                <p className="text-xs text-muted-foreground">
-                  {!hasSandbox ? "Waiting for sandbox…" : "No files found"}
-                </p>
+              <div className="p-3">
+                <div className="flex w-full flex-col items-center gap-1.5 rounded-lg border border-dashed border-muted-foreground/25 py-8 text-center">
+                  <p className="text-xs text-muted-foreground">
+                    {!hasSandbox ? "Waiting for sandbox…" : "No files found"}
+                  </p>
+                </div>
               </div>
             )}
           </div>
@@ -1882,6 +1980,8 @@ export function GitPanel(props: GitPanelProps) {
                     onCommitted={onCommitted}
                     isAgentWorking={isAgentWorking}
                     baseBranch={baseBranch}
+                    connectionStatus={connectionStatus}
+                    reconnectRequired={reconnectRequired}
                   />
                 </div>
               )}
@@ -1926,25 +2026,55 @@ export function GitPanel(props: GitPanelProps) {
                       Uncommitted
                     </button>
                   </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      void Promise.all([refreshDiff(), refreshGitStatus()]);
-                    }}
-                    disabled={!hasSandbox || isRefreshingChanges}
-                    className="h-6 w-6 shrink-0 px-0"
-                    title="Refresh changes"
-                    aria-label="Refresh changes"
-                  >
-                    <RefreshCw
-                      className={cn(
-                        "h-3.5 w-3.5",
-                        isRefreshingChanges && "animate-spin",
-                      )}
-                    />
-                  </Button>
+                  <div className="flex items-center gap-1">
+                    {hasUncommittedGitChanges ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setDiscardTarget(null);
+                          setDiscardError(null);
+                          setDiscardDialogOpen(true);
+                        }}
+                        disabled={
+                          !hasSandbox || isDiscardingChanges || isAgentWorking
+                        }
+                        className="h-6 w-6 shrink-0 px-0 text-muted-foreground hover:text-destructive"
+                        title="Discard uncommitted changes"
+                        aria-label="Discard uncommitted changes"
+                      >
+                        {isDiscardingChanges ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        void Promise.all([
+                          refreshDiff(),
+                          refreshGitStatus(),
+                          refreshFiles(),
+                        ]);
+                      }}
+                      disabled={!hasSandbox || isRefreshingChanges}
+                      className="h-6 w-6 shrink-0 px-0"
+                      title="Refresh changes"
+                      aria-label="Refresh changes"
+                    >
+                      <RefreshCw
+                        className={cn(
+                          "h-3.5 w-3.5",
+                          isRefreshingChanges && "animate-spin",
+                        )}
+                      />
+                    </Button>
+                  </div>
                 </div>
               )}
 
@@ -1991,7 +2121,23 @@ export function GitPanel(props: GitPanelProps) {
             {/* Scrollable file list */}
             <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
               {diffFiles && diffFiles.length > 0 ? (
-                <DiffFileList files={diffFiles} />
+                <DiffFileList
+                  files={diffFiles}
+                  onDiscardFile={(file) => {
+                    setDiscardTarget({
+                      filePath: file.path,
+                      ...(file.oldPath ? { oldPath: file.oldPath } : {}),
+                    });
+                    setDiscardError(null);
+                    setDiscardDialogOpen(true);
+                  }}
+                  discardingFilePath={
+                    isDiscardingChanges && discardTarget
+                      ? discardingFilePath
+                      : null
+                  }
+                  discardDisabled={isDiscardingChanges || isAgentWorking}
+                />
               ) : (
                 <div className="flex w-full flex-col items-center gap-1.5 rounded-lg border border-dashed border-muted-foreground/25 py-8 text-center">
                   <p className="text-xs text-muted-foreground">
@@ -2030,6 +2176,8 @@ export function GitPanel(props: GitPanelProps) {
                 onGitMessage={onGitMessage}
                 isAgentWorking={isAgentWorking}
                 baseBranch={baseBranch}
+                connectionStatus={connectionStatus}
+                reconnectRequired={reconnectRequired}
               />
             ) : (
               <div className="text-center text-xs text-muted-foreground py-6">
@@ -2039,6 +2187,55 @@ export function GitPanel(props: GitPanelProps) {
           </div>
         )}
       </div>
+
+      <Dialog
+        open={discardDialogOpen}
+        onOpenChange={(open) => {
+          if (!isDiscardingChanges) {
+            setDiscardDialogOpen(open);
+          }
+          if (!open) {
+            setDiscardError(null);
+            setDiscardTarget(null);
+          }
+        }}
+      >
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>{discardTitle}</DialogTitle>
+            <DialogDescription>{discardDescription}</DialogDescription>
+          </DialogHeader>
+          {discardError ? (
+            <div className="rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+              {discardError}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" disabled={isDiscardingChanges}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={() => void handleDiscardChanges()}
+              disabled={isDiscardingChanges}
+            >
+              {isDiscardingChanges ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Discarding...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  {discardTarget ? "Discard file" : "Discard changes"}
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

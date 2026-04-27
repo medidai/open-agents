@@ -4,6 +4,7 @@ import { botIdConfig } from "@/lib/botid";
 import { start } from "workflow/api";
 import type { WebAgentUIMessage } from "@/app/types";
 import {
+  claimChatActiveStreamId,
   compareAndSetChatActiveStreamId,
   countUserMessagesByUserId,
   createChatMessageIfNotExists,
@@ -185,13 +186,17 @@ export async function POST(req: Request) {
     session,
     req.url,
   );
-  const mainModelSelection = resolveChatModelSelection({
-    selectedModelId: sanitizeSelectedModelIdForSession(
+  const selectedModelId =
+    sanitizeSelectedModelIdForSession(
       chat.modelId,
       modelVariants,
       session,
       req.url,
-    ),
+    ) ??
+    chat.modelId ??
+    null;
+  const mainModelSelection = resolveChatModelSelection({
+    selectedModelId,
     modelVariants,
     missingVariantLabel: "Selected model variant",
   });
@@ -224,6 +229,7 @@ export async function POST(req: Request) {
       chatId,
       sessionId,
       userId,
+      selectedModelId: selectedModelId ?? mainModelSelection.id,
       modelId: mainModelSelection.id,
       maxSteps: 500,
       agentOptions: {
@@ -252,16 +258,13 @@ export async function POST(req: Request) {
     },
   ]);
 
-  // Atomically claim the activeStreamId slot. If another request raced us and
-  // already set it, cancel the workflow we just started and reconnect instead.
-  const claimed = await compareAndSetChatActiveStreamId(
-    chatId,
-    null,
-    run.runId,
-  );
+  // Idempotently claim the activeStreamId slot for the workflow we just
+  // started. This succeeds both when the slot is still null and when the
+  // workflow already self-claimed it from inside its first step.
+  const claimed = await claimChatActiveStreamId(chatId, run.runId);
 
   if (!claimed) {
-    // Another request won the race — cancel our duplicate workflow.
+    // Another request or workflow run owns the slot — cancel our duplicate.
     try {
       const { getRun } = await import("workflow/api");
       getRun(run.runId).cancel();

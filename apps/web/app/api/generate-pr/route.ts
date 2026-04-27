@@ -1,23 +1,17 @@
 import { checkBotId } from "botid/server";
-import { botIdConfig } from "@/lib/botid";
-import { connectSandbox } from "@open-harness/sandbox";
+import { connectSandbox } from "@open-agents/sandbox";
 import { gateway, generateText } from "ai";
+import { botIdConfig } from "@/lib/botid";
 import {
-  ensureForkExists,
-  extractGitHubOwnerFromRemoteUrl,
-  forkPushRetryConfig,
   generateBranchName,
   isPermissionPushError,
-  isRetryableForkPushError,
   looksLikeCommitHash,
   redactGitHubToken,
-  sleepForForkRetry,
 } from "@/app/api/generate-pr/_lib/generate-pr-helpers";
-import { getGitHubAccount } from "@/lib/db/accounts";
+import { getGitHubUserProfile, getUserGitHubToken } from "@/lib/github/token";
 import { getSessionById, updateSession } from "@/lib/db/sessions";
 import { buildGitHubAuthRemoteUrl } from "@/lib/github/repo-identifiers";
 import { generatePullRequestContentFromSandbox } from "@/lib/git/pr-content";
-import { getUserGitHubToken } from "@/lib/github/user-token";
 import { getAppCoAuthorTrailer } from "@/lib/github/app-auth";
 import { isSandboxActive } from "@/lib/sandbox/utils";
 import { getServerSession } from "@/lib/session/get-server-session";
@@ -285,9 +279,7 @@ export async function POST(req: Request) {
     commitMessage?: string;
     commitSha?: string;
     pushed?: boolean;
-    pushedToFork?: boolean;
   } = {};
-  let prHeadOwner: string | null = null;
 
   if (hasUncommittedChanges) {
     // 4a. Stage all changes first so untracked files are included in diff
@@ -346,11 +338,11 @@ Respond with ONLY the commit message, nothing else.`,
     // Set the git author identity to the authenticated user so the commit is
     // attributed to them. A Co-Authored-By trailer is appended for the GitHub
     // App bot so the agent's involvement is visible in the commit history.
-    const githubAccount = await getGitHubAccount(session.user.id);
-    if (githubAccount?.externalUserId && githubAccount.username) {
-      const userEmail = `${githubAccount.externalUserId}+${githubAccount.username}@users.noreply.github.com`;
+    const ghProfile = await getGitHubUserProfile(session.user.id);
+    if (ghProfile?.externalUserId && ghProfile.username) {
+      const userEmail = `${ghProfile.externalUserId}+${ghProfile.username}@users.noreply.github.com`;
       await sandbox.exec(
-        `git config user.name '${githubAccount.username.replace(/'/g, "'\\''")}'`,
+        `git config user.name '${ghProfile.username.replace(/'/g, "'\\''")}'`,
         cwd,
         5000,
       );
@@ -407,24 +399,6 @@ Respond with ONLY the commit message, nothing else.`,
     trackingResult.stdout.includes("needs-push") ||
     trackingResult.stdout.trim().length > 0;
 
-  const upstreamRefResult = await sandbox.exec(
-    "git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true",
-    cwd,
-    10000,
-  );
-  const upstreamRef = upstreamRefResult.stdout.trim();
-  if (upstreamRef.startsWith("fork/")) {
-    const forkUrlResult = await sandbox.exec(
-      "git remote get-url fork 2>/dev/null || true",
-      cwd,
-      10000,
-    );
-    const forkOwner = extractGitHubOwnerFromRemoteUrl(forkUrlResult.stdout);
-    if (forkOwner) {
-      prHeadOwner = forkOwner;
-    }
-  }
-
   if (needsPush) {
     // 5a. Fetch latest from origin to check for conflicts
     await sandbox.exec("git fetch origin", cwd, 30000);
@@ -462,124 +436,14 @@ Respond with ONLY the commit message, nothing else.`,
         isPermissionError = true;
       }
 
-      if (
-        !gitActions.pushed &&
-        isPermissionError &&
-        sessionRecord.repoOwner &&
-        sessionRecord.repoName
-      ) {
-        const githubAccount = await getGitHubAccount(session.user.id);
-
-        if (userToken && githubAccount?.username) {
-          const forkOwner = githubAccount.username;
-          const forkResult = await ensureForkExists({
-            token: userToken,
-            upstreamOwner: sessionRecord.repoOwner,
-            upstreamRepo: sessionRecord.repoName,
-            forkOwner,
-          });
-
-          if (!forkResult.success) {
-            return Response.json(
-              {
-                error: `Failed to push to upstream and fork fallback failed: ${forkResult.error}`,
-              },
-              { status: 500 },
-            );
-          }
-
-          const { forkRepoName } = forkResult;
-          const forkAuthUrl = `https://x-access-token:${userToken}@github.com/${forkOwner}/${forkRepoName}.git`;
-
-          await sandbox.exec(
-            "git remote remove fork 2>/dev/null || true",
-            cwd,
-            10000,
-          );
-          const addForkResult = await sandbox.exec(
-            `git remote add fork "${forkAuthUrl}"`,
-            cwd,
-            10000,
-          );
-
-          if (!addForkResult.success) {
-            return Response.json(
-              {
-                error: `Failed to configure fork remote: ${(addForkResult.stderr ?? addForkResult.stdout).slice(0, 200)}`,
-              },
-              { status: 500 },
-            );
-          }
-
-          let pushToForkSucceeded = false;
-          let lastPushForkOutput = "";
-
-          for (
-            let attempt = 1;
-            attempt <= forkPushRetryConfig.attempts;
-            attempt += 1
-          ) {
-            const pushForkResult = await sandbox.exec(
-              `GIT_TERMINAL_PROMPT=0 git push --verbose -u fork ${resolvedBranch}`,
-              cwd,
-              60000,
-            );
-
-            if (pushForkResult.success) {
-              pushToForkSucceeded = true;
-              console.log(
-                `[generate-pr] Push to origin denied; pushed branch to fork ${forkOwner}/${forkRepoName}`,
-              );
-              prHeadOwner = forkOwner;
-              gitActions.pushed = true;
-              gitActions.pushedToFork = true;
-              break;
-            }
-
-            lastPushForkOutput =
-              `${pushForkResult.stdout}\n${pushForkResult.stderr ?? ""}`.trim();
-
-            if (
-              isRetryableForkPushError(lastPushForkOutput) &&
-              attempt < forkPushRetryConfig.attempts
-            ) {
-              console.log(
-                `[generate-pr] Fork push retry ${attempt}/${forkPushRetryConfig.attempts}: waiting for fork repository to become available`,
-              );
-              await sleepForForkRetry();
-              continue;
-            }
-
-            break;
-          }
-
-          if (!pushToForkSucceeded) {
-            if (isPermissionPushError(lastPushForkOutput)) {
-              return Response.json(
-                {
-                  error:
-                    "Failed to push to your fork. Ensure your linked GitHub account has permission to create and push to forks.",
-                },
-                { status: 403 },
-              );
-            }
-
-            return Response.json(
-              {
-                error: `Failed to push to fork ${forkOwner}/${forkRepoName}: ${redactGitHubToken(lastPushForkOutput).slice(0, 200)}`,
-              },
-              { status: 500 },
-            );
-          }
-        } else {
-          return Response.json(
-            {
-              error:
-                "Failed to push to upstream and no linked GitHub account is available for fork fallback.",
-            },
-            { status: 500 },
-          );
-        }
+      if (isPermissionError) {
+        return Response.json(
+          {
+            error:
+              "Push failed — your GitHub account may no longer have write access to this repository. Reconnect GitHub or check your repository permissions at /settings/connections.",
+          },
+          { status: 403 },
+        );
       }
 
       if (!gitActions.pushed) {
@@ -610,7 +474,6 @@ Respond with ONLY the commit message, nothing else.`,
     return Response.json({
       branchName: resolvedBranch,
       gitActions,
-      ...(prHeadOwner ? { prHeadOwner } : {}),
     });
   }
 
@@ -632,7 +495,6 @@ Respond with ONLY the commit message, nothing else.`,
     title: prContentResult.title,
     body: prContentResult.body,
     branchName: resolvedBranch,
-    ...(prHeadOwner ? { prHeadOwner } : {}),
     ...(Object.keys(gitActions).length > 0 && { gitActions }),
   });
 }
