@@ -8,11 +8,10 @@ import {
   looksLikeCommitHash,
   redactGitHubToken,
 } from "@/app/api/generate-pr/_lib/generate-pr-helpers";
-import { getGitHubUserProfile, getUserGitHubToken } from "@/lib/github/token";
 import { getSessionById, updateSession } from "@/lib/db/sessions";
 import { buildGitHubAuthRemoteUrl } from "@/lib/github/repo-identifiers";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { generatePullRequestContentFromSandbox } from "@/lib/git/pr-content";
-import { getAppCoAuthorTrailer } from "@/lib/github/app-auth";
 import { isSandboxActive } from "@/lib/sandbox/utils";
 import { getServerSession } from "@/lib/session/get-server-session";
 
@@ -99,11 +98,15 @@ export async function POST(req: Request) {
   // 3. Connect to sandbox
   const sandbox = await connectSandbox(sessionRecord.sandboxState);
   const cwd = sandbox.workingDirectory;
-  let userToken: string | null = null;
+  let resolvedAuth: Awaited<ReturnType<typeof resolveGitHubAuth>> = null;
 
   if (sessionRecord.repoOwner && sessionRecord.repoName) {
-    userToken = await getUserGitHubToken(session.user.id);
-    if (!userToken) {
+    resolvedAuth = await resolveGitHubAuth({
+      userId: session.user.id,
+      owner: sessionRecord.repoOwner,
+      repo: sessionRecord.repoName,
+    });
+    if (!resolvedAuth) {
       return Response.json(
         { error: "No GitHub token available for this repository" },
         { status: 403 },
@@ -111,7 +114,7 @@ export async function POST(req: Request) {
     }
 
     const authUrl = buildGitHubAuthRemoteUrl({
-      token: userToken,
+      token: resolvedAuth.token,
       owner: sessionRecord.repoOwner,
       repo: sessionRecord.repoName,
     });
@@ -335,22 +338,26 @@ Respond with ONLY the commit message, nothing else.`,
     // Using single quotes is safest, but we need to handle single quotes in the message
     // by ending the quote, adding an escaped single quote, and starting a new quote
     //
-    // Set the git author identity to the authenticated user so the commit is
-    // attributed to them. A Co-Authored-By trailer is appended for the GitHub
-    // App bot so the agent's involvement is visible in the commit history.
-    const ghProfile = await getGitHubUserProfile(session.user.id);
-    if (ghProfile?.externalUserId && ghProfile.username) {
-      const userEmail = `${ghProfile.externalUserId}+${ghProfile.username}@users.noreply.github.com`;
+    // Set the git author identity based on the resolved auth source: when the
+    // user has a linked GitHub account, the commit is attributed to them and a
+    // bot Co-authored-by trailer records the agent's involvement. When the
+    // user has no linked GitHub account, the App bot is the committer and the
+    // Vercel user is recorded via Co-authored-by.
+    if (resolvedAuth) {
       await sandbox.exec(
-        `git config user.name '${ghProfile.username.replace(/'/g, "'\\''")}'`,
+        `git config user.name '${resolvedAuth.gitUser.name.replace(/'/g, "'\\''")}'`,
         cwd,
         5000,
       );
-      await sandbox.exec(`git config user.email '${userEmail}'`, cwd, 5000);
+      await sandbox.exec(
+        `git config user.email '${resolvedAuth.gitUser.email.replace(/'/g, "'\\''")}'`,
+        cwd,
+        5000,
+      );
     }
 
     const escapedMessage = commitMessage.replace(/'/g, "'\\''");
-    const coAuthorTrailer = await getAppCoAuthorTrailer();
+    const coAuthorTrailer = resolvedAuth?.coAuthorTrailer ?? null;
     const trailerArg = coAuthorTrailer
       ? ` -m '${coAuthorTrailer.replace(/'/g, "'\\''")}'`
       : "";

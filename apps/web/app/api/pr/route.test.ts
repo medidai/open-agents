@@ -79,6 +79,19 @@ function registerRouteMocks() {
 
   mock.module("@/lib/github/token", () => ({
     getUserGitHubToken: async () => userToken,
+    getGitHubUserProfile: async () => null,
+  }));
+
+  mock.module("@/lib/github/resolve-token", () => ({
+    resolveGitHubAuth: async () =>
+      userToken
+        ? {
+            source: "user",
+            token: userToken,
+            gitUser: { name: "Test User", email: "test@example.com" },
+            coAuthorTrailer: null,
+          }
+        : null,
   }));
 
   mock.module("@/lib/github/client", () => ({

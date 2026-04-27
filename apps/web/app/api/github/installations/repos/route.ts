@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getInstallationByUserAndId } from "@/lib/db/installations";
-import { listUserInstallationRepositories } from "@/lib/github/installation-repos";
+import { isGitHubAppConfigured } from "@/lib/github/app-auth";
+import {
+  listAppInstallationRepositories,
+  listUserInstallationRepositories,
+} from "@/lib/github/installation-repos";
+import {
+  type AppInstallationSummary,
+  listAllAppInstallations,
+} from "@/lib/github/installation-resolver";
 import { getUserGitHubToken } from "@/lib/github/token";
 import { getServerSession } from "@/lib/session/get-server-session";
 
@@ -43,34 +51,50 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const installation = await getInstallationByUserAndId(
+  const userInstallation = await getInstallationByUserAndId(
     session.user.id,
     installationId,
   );
-  if (!installation) {
-    return NextResponse.json(
-      { error: "Installation not found" },
-      { status: 403 },
-    );
-  }
-
-  const userToken = await getUserGitHubToken(session.user.id);
-  if (!userToken) {
-    return NextResponse.json(
-      { error: "GitHub not connected" },
-      { status: 401 },
-    );
-  }
+  const userToken = userInstallation
+    ? await getUserGitHubToken(session.user.id)
+    : null;
 
   try {
-    const repos = await listUserInstallationRepositories({
+    if (userInstallation && userToken) {
+      const repos = await listUserInstallationRepositories({
+        installationId,
+        userToken,
+        owner: userInstallation.accountLogin,
+        query,
+        limit,
+      });
+      return NextResponse.json(repos);
+    }
+
+    // App fallback: confirm the installation belongs to the App, then list
+    // its repos using an installation token.
+    if (!isGitHubAppConfigured()) {
+      return NextResponse.json(
+        { error: "Installation not found" },
+        { status: 403 },
+      );
+    }
+
+    const appInstallations = await listAllAppInstallations();
+    const appInstallation: AppInstallationSummary | undefined =
+      appInstallations.find((entry) => entry.installationId === installationId);
+    if (!appInstallation) {
+      return NextResponse.json(
+        { error: "Installation not found" },
+        { status: 403 },
+      );
+    }
+
+    const repos = await listAppInstallationRepositories({
       installationId,
-      userToken,
-      owner: installation.accountLogin,
       query,
       limit,
     });
-
     return NextResponse.json(repos);
   } catch (error) {
     console.error("Failed to fetch installation repositories:", error);

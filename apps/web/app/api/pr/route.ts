@@ -4,7 +4,7 @@ import {
   enablePullRequestAutoMerge,
   parseGitHubUrl,
 } from "@/lib/github/client";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { getServerSession } from "@/lib/session/get-server-session";
 
 interface CreatePRRequest {
@@ -135,8 +135,12 @@ export async function POST(req: Request) {
     return Response.json({ error: "Invalid head owner" }, { status: 400 });
   }
 
-  const userToken = await getUserGitHubToken(session.user.id);
-  if (!userToken) {
+  const auth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: parsedRepoUrl.owner,
+    repo: parsedRepoUrl.repo,
+  });
+  if (!auth) {
     return Response.json(
       { error: "No GitHub token available for this repository" },
       { status: 403 },
@@ -152,7 +156,7 @@ export async function POST(req: Request) {
   }
 
   // 4. Create PR using existing function
-  const tokenUsedForCreation = userToken;
+  const tokenUsedForCreation = auth.token;
   const result = await createPullRequest({
     repoUrl,
     branchName: resolvedBranch,

@@ -11,7 +11,7 @@ import {
   isValidGitHubRepoName,
   isValidGitHubRepoOwner,
 } from "@/lib/github/repo-identifiers";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { generatePullRequestContentFromSandbox } from "@/lib/git/pr-content";
 
 const SAFE_BRANCH_PATTERN = /^[\w\-/.]+$/;
@@ -137,8 +137,12 @@ export async function performAutoCreatePr(
     };
   }
 
-  const userToken = await getUserGitHubToken(userId);
-  if (!userToken) {
+  const auth = await resolveGitHubAuth({
+    userId,
+    owner: repoOwner,
+    repo: repoName,
+  });
+  if (!auth) {
     return {
       created: false,
       syncedExisting: false,
@@ -146,6 +150,8 @@ export async function performAutoCreatePr(
       skipReason: "No GitHub token available for this repository",
     };
   }
+
+  const userToken = auth.token;
 
   const authUrl = buildGitHubAuthRemoteUrl({
     token: userToken,

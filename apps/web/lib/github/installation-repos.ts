@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { getInstallationToken } from "./app-auth";
 
 const INSTALLATION_REPOS_MAX_PAGES = 20;
 
@@ -127,6 +128,87 @@ export async function listUserInstallationRepositories({
 
       return matchesOwner && matchesQuery;
     });
+
+    matchedRepos.push(...pageMatches);
+
+    if (matchedRepos.length >= normalizedLimit) {
+      break;
+    }
+
+    if (parsed.data.repositories.length < perPage) {
+      break;
+    }
+  }
+
+  matchedRepos.sort(compareRepositoriesByRecentActivity);
+
+  return matchedRepos.slice(0, normalizedLimit).map((repo) => ({
+    name: repo.name,
+    full_name: repo.full_name,
+    description: repo.description,
+    private: repo.private,
+    clone_url: repo.clone_url,
+    updated_at: repo.updated_at,
+    language: repo.language,
+  }));
+}
+
+/**
+ * List repositories accessible to a GitHub App installation directly, using
+ * an installation token. Used when no user OAuth token is available — e.g.
+ * a Vercel-only login that hasn't linked GitHub. Unlike the user-scoped
+ * variant, this returns every repo the installation can access.
+ */
+export async function listAppInstallationRepositories({
+  installationId,
+  query,
+  limit,
+}: {
+  installationId: number;
+  query?: string;
+  limit?: number;
+}): Promise<InstallationRepository[]> {
+  const queryFilter = query?.trim().toLowerCase();
+  const normalizedLimit = normalizeLimit(limit);
+  const token = await getInstallationToken(installationId);
+
+  const perPage = 100;
+  const matchedRepos: z.infer<typeof installationRepoSchema>[] = [];
+
+  for (let page = 1; page <= INSTALLATION_REPOS_MAX_PAGES; page++) {
+    const endpoint = new URL(
+      "https://api.github.com/installation/repositories",
+    );
+    endpoint.searchParams.set("per_page", `${perPage}`);
+    endpoint.searchParams.set("page", `${page}`);
+
+    const response = await fetch(endpoint, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github.v3+json",
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Failed to fetch app installation repositories: ${response.status} ${body}`,
+      );
+    }
+
+    const json = await response.json();
+    const parsed = installationReposResponseSchema.safeParse(json);
+    if (!parsed.success) {
+      throw new Error("Invalid GitHub installation repositories response");
+    }
+
+    if (parsed.data.repositories.length === 0) {
+      break;
+    }
+
+    const pageMatches = parsed.data.repositories.filter((repo) =>
+      queryFilter ? repo.name.toLowerCase().includes(queryFilter) : true,
+    );
 
     matchedRepos.push(...pageMatches);
 

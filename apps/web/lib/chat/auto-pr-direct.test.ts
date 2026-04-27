@@ -72,6 +72,16 @@ const generatePullRequestContentFromSandboxSpy = mock(
   async () => prContentResult,
 );
 const getUserGitHubTokenSpy = mock(async (_userId?: string) => userTokenResult);
+const resolveGitHubAuthSpy = mock(async (_params: unknown) =>
+  userTokenResult
+    ? {
+        source: "user" as const,
+        token: userTokenResult,
+        gitUser: { name: "Test User", email: "test@example.com" },
+        coAuthorTrailer: null,
+      }
+    : null,
+);
 
 const sandbox = {
   workingDirectory: "/vercel/sandbox",
@@ -92,6 +102,11 @@ mock.module("@/lib/github/api", () => ({
 
 mock.module("@/lib/github/token", () => ({
   getUserGitHubToken: getUserGitHubTokenSpy,
+  getGitHubUserProfile: async () => null,
+}));
+
+mock.module("@/lib/github/resolve-token", () => ({
+  resolveGitHubAuth: resolveGitHubAuthSpy,
 }));
 
 mock.module("@/lib/github/client", () => ({
@@ -148,6 +163,7 @@ beforeEach(() => {
   createPullRequestSpy.mockClear();
   generatePullRequestContentFromSandboxSpy.mockClear();
   getUserGitHubTokenSpy.mockClear();
+  resolveGitHubAuthSpy.mockClear();
 
   execResults = defaultExecResults();
   userTokenResult = "ghp_user";
@@ -295,7 +311,11 @@ describe("performAutoCreatePr", () => {
       prNumber: 42,
       prUrl: "https://github.com/acme/repo/pull/42",
     } satisfies AutoCreatePrResult);
-    expect(getUserGitHubTokenSpy).toHaveBeenCalledWith("user-1");
+    expect(resolveGitHubAuthSpy).toHaveBeenCalledWith({
+      userId: "user-1",
+      owner: "acme",
+      repo: "repo",
+    });
     expect(generatePullRequestContentFromSandboxSpy).toHaveBeenCalledTimes(1);
     expect(createPullRequestSpy).toHaveBeenCalledWith(
       expect.objectContaining({

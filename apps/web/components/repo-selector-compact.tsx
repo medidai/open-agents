@@ -179,7 +179,7 @@ export function RepoSelectorCompact({
   const { data: installations = [], isLoading: installationsLoading } = useSWR<
     Installation[]
   >(
-    hasGitHub && !reconnectRequired ? "github-installations" : null,
+    sessionLoading || reconnectRequired ? null : "github-installations",
     fetchInstallations,
   );
 
@@ -267,18 +267,6 @@ export function RepoSelectorCompact({
   const isInitialLoading = installationsLoading && installations.length === 0;
   const hasSelection = selectedOwner && selectedRepo;
 
-  // Not connected to GitHub
-  if (!sessionLoading && !hasGitHub) {
-    return (
-      <GitHubActionCard
-        title="Install GitHub App"
-        description="Continue on GitHub to choose which repositories are available."
-        buttonLabel="Choose repositories"
-        onClick={startGitHubInstall}
-      />
-    );
-  }
-
   if (reconnectRequired) {
     return (
       <GitHubActionCard
@@ -290,12 +278,14 @@ export function RepoSelectorCompact({
     );
   }
 
-  // No installations
+  // No installations available — App not installed anywhere yet, or this
+  // user's linked installations are empty. Either way, point them at the
+  // App install flow.
   if (!installationsLoading && installations.length === 0) {
     return (
       <GitHubActionCard
         title="Install GitHub App"
-        description="Install the GitHub App to choose which repositories are available."
+        description="Install the GitHub App on a repository to make it available here."
         buttonLabel="Choose repositories"
         onClick={startGitHubInstall}
       />

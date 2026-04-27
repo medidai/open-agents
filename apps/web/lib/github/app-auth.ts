@@ -45,27 +45,30 @@ export function isGitHubAppConfigured(): boolean {
 }
 
 /**
- * Cached co-author trailer so we only hit the GitHub API once per process.
+ * Cached bot git identity so we only hit the GitHub API once per process.
  * `undefined` = not yet fetched.
  */
-let cachedTrailer: string | null | undefined;
+let cachedBotIdentity: { name: string; email: string } | null | undefined;
 
 /**
- * Returns a git commit trailer for co-authoring with the GitHub App bot, e.g.:
- *   Co-Authored-By: open-agents[bot] <260704009+open-agents[bot]@users.noreply.github.com>
+ * Returns the GitHub App bot's git identity, e.g.:
+ *   { name: "open-agents[bot]", email: "260704009+open-agents[bot]@users.noreply.github.com" }
  *
  * The numeric prefix is the bot's **user** ID (not the app ID) so that GitHub
  * can resolve the account and display the bot avatar inline on PR commits.
  *
- * The result is cached for the lifetime of the process.
- * Returns null if the app is not configured.
+ * Cached for the lifetime of the process. Returns null if the app slug is
+ * not configured.
  */
-export async function getAppCoAuthorTrailer(): Promise<string | null> {
-  if (cachedTrailer !== undefined) return cachedTrailer;
+export async function getBotGitIdentity(): Promise<{
+  name: string;
+  email: string;
+} | null> {
+  if (cachedBotIdentity !== undefined) return cachedBotIdentity;
 
   const slug = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG;
   if (!slug) {
-    cachedTrailer = null;
+    cachedBotIdentity = null;
     return null;
   }
 
@@ -88,8 +91,20 @@ export async function getAppCoAuthorTrailer(): Promise<string | null> {
   const botEmail = botUserId
     ? `${botUserId}+${botName}@users.noreply.github.com`
     : `${botName}@users.noreply.github.com`;
-  cachedTrailer = `Co-Authored-By: ${botName} <${botEmail}>`;
-  return cachedTrailer;
+  cachedBotIdentity = { name: botName, email: botEmail };
+  return cachedBotIdentity;
+}
+
+/**
+ * Returns a git commit trailer for co-authoring with the GitHub App bot, e.g.:
+ *   Co-Authored-By: open-agents[bot] <260704009+open-agents[bot]@users.noreply.github.com>
+ *
+ * Returns null if the app is not configured.
+ */
+export async function getAppCoAuthorTrailer(): Promise<string | null> {
+  const identity = await getBotGitIdentity();
+  if (!identity) return null;
+  return `Co-Authored-By: ${identity.name} <${identity.email}>`;
 }
 
 export async function getInstallationToken(

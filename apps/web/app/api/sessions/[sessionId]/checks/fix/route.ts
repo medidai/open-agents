@@ -3,7 +3,7 @@ import {
   requireOwnedSession,
 } from "@/app/api/sessions/_lib/session-context";
 import type { PullRequestCheckRun } from "@/lib/github/client";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { Octokit } from "@octokit/rest";
 import { gateway, generateText } from "ai";
 
@@ -235,16 +235,20 @@ export async function POST(req: Request, context: RouteContext) {
   const allAnnotations: Record<string, CheckAnnotation[]> = {};
 
   if (runsWithIds.length > 0) {
-    const token = await getUserGitHubToken(authResult.userId);
-    if (!token) {
+    const owner = sessionRecord.repoOwner;
+    const repo = sessionRecord.repoName;
+    const auth = await resolveGitHubAuth({
+      userId: authResult.userId,
+      owner,
+      repo,
+    });
+    if (!auth) {
       return Response.json(
         formatFixResponse(checkRuns, compactedLogs, allAnnotations),
       );
     }
 
-    const octokit = new Octokit({ auth: token });
-    const owner = sessionRecord.repoOwner;
-    const repo = sessionRecord.repoName;
+    const octokit = new Octokit({ auth: auth.token });
 
     await Promise.all(
       runsWithIds.map(async (run) => {

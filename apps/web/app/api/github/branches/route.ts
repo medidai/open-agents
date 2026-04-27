@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchGitHubBranches } from "@/lib/github/api";
+import {
+  getInstallationToken,
+  isGitHubAppConfigured,
+} from "@/lib/github/app-auth";
+import { getInstallationIdForRepo } from "@/lib/github/installation-resolver";
 import { getUserGitHubToken } from "@/lib/github/token";
 import { getServerSession } from "@/lib/session/get-server-session";
 
@@ -286,7 +291,23 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const token = await getUserGitHubToken(session.user.id);
+  let token = await getUserGitHubToken(session.user.id);
+
+  // Fall back to a GitHub App installation token so users without a linked
+  // GitHub account can still see branches for repos the App is installed on.
+  if (!token && isGitHubAppConfigured()) {
+    const installationId = await getInstallationIdForRepo({ owner, repo });
+    if (installationId) {
+      try {
+        token = await getInstallationToken(installationId);
+      } catch (error) {
+        console.error(
+          `Failed to mint installation token for ${owner}/${repo}:`,
+          error,
+        );
+      }
+    }
+  }
 
   try {
     if (token) {

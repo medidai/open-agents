@@ -6,9 +6,14 @@ import {
   type SessionRecord,
 } from "@/app/api/sessions/_lib/session-context";
 import { botIdConfig } from "@/lib/botid";
-import { getGitHubUserProfile, getUserGitHubToken } from "@/lib/github/token";
+import { getUserGitHubToken } from "@/lib/github/token";
 import { updateSession } from "@/lib/db/sessions";
 import { parseGitHubUrl } from "@/lib/github/client";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
+import {
+  installCommitTrailerHook,
+  removeCommitTrailerHook,
+} from "@/lib/sandbox/commit-trailer-hook";
 import {
   DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
   DEFAULT_SANDBOX_PORTS,
@@ -108,7 +113,8 @@ export async function POST(req: Request) {
     return Response.json({ error: "Access denied" }, { status: 403 });
   }
 
-  const githubToken = await getUserGitHubToken(session.user.id);
+  let resolvedAuth: Awaited<ReturnType<typeof resolveGitHubAuth>> = null;
+  let githubToken: string | null = null;
 
   if (repoUrl) {
     const parsedRepo = parseGitHubUrl(repoUrl);
@@ -119,12 +125,22 @@ export async function POST(req: Request) {
       );
     }
 
-    if (!githubToken) {
+    resolvedAuth = await resolveGitHubAuth({
+      userId: session.user.id,
+      owner: parsedRepo.owner,
+      repo: parsedRepo.repo,
+    });
+
+    if (!resolvedAuth) {
       return Response.json(
         { error: "Connect GitHub to access repositories" },
         { status: 403 },
       );
     }
+
+    githubToken = resolvedAuth.token;
+  } else {
+    githubToken = await getUserGitHubToken(session.user.id);
   }
 
   // Validate session ownership
@@ -142,19 +158,15 @@ export async function POST(req: Request) {
   }
 
   const sandboxName = sessionId ? getSessionSandboxName(sessionId) : undefined;
-  const ghProfile = await getGitHubUserProfile(session.user.id);
-  const githubNoreplyEmail =
-    ghProfile?.externalUserId && ghProfile.username
-      ? `${ghProfile.externalUserId}+${ghProfile.username}@users.noreply.github.com`
-      : undefined;
 
-  const gitUser = {
-    name: session.user.name ?? ghProfile?.username ?? session.user.username,
-    email:
-      githubNoreplyEmail ??
-      session.user.email ??
-      `${session.user.username}@users.noreply.github.com`,
-  };
+  const gitUser = resolvedAuth
+    ? resolvedAuth.gitUser
+    : {
+        name: session.user.name ?? session.user.username,
+        email:
+          session.user.email ??
+          `${session.user.username}@users.noreply.github.com`,
+      };
 
   // ============================================
   // CREATE OR RESUME: Create a named persistent sandbox for this session.
@@ -248,6 +260,26 @@ export async function POST(req: Request) {
       } catch (error) {
         console.error(
           `Failed to install global skills for session ${sessionRecord.id}:`,
+          error,
+        );
+      }
+
+      // When the GitHub App is acting on behalf of an unlinked Vercel user,
+      // install a prepare-commit-msg hook that records the user via a
+      // Co-authored-by trailer. Otherwise ensure the hook is removed (in case
+      // the user just linked their GitHub account on a persistent sandbox).
+      try {
+        if (resolvedAuth?.source === "app" && resolvedAuth.coAuthorTrailer) {
+          await installCommitTrailerHook({
+            sandbox,
+            trailer: resolvedAuth.coAuthorTrailer,
+          });
+        } else {
+          await removeCommitTrailerHook({ sandbox });
+        }
+      } catch (error) {
+        console.error(
+          `Failed to configure commit trailer hook for session ${sessionRecord.id}:`,
           error,
         );
       }
