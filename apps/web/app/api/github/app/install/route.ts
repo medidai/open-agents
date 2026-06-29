@@ -1,26 +1,16 @@
 import { generateState } from "arctic";
 import { NextResponse, type NextRequest } from "next/server";
 import { getInstallationsByUserId } from "@/lib/db/installations";
-import { syncUserInstallations } from "@/lib/github/installations-sync";
+import { syncUserInstallations } from "@/lib/github/sync";
+import { getUserGitHubToken } from "@/lib/github/token";
 import {
   getGitHubAccountId,
-  getUserGitHubToken,
   getGitHubUsername,
   hasGitHubAccount,
-} from "@/lib/github/token";
+} from "@/lib/github/users";
+import { isManagedTemplateTrialUser } from "@/lib/managed-template-trial";
+import { sanitizeInternalRedirect } from "@/lib/redirect-safety";
 import { getServerSession } from "@/lib/session/get-server-session";
-
-function sanitizeRedirectTo(rawRedirectTo: string | null): string {
-  if (!rawRedirectTo) {
-    return "/get-started";
-  }
-
-  if (!rawRedirectTo.startsWith("/") || rawRedirectTo.startsWith("//")) {
-    return "/get-started";
-  }
-
-  return rawRedirectTo;
-}
 
 const COOKIE_OPTIONS = {
   path: "/",
@@ -47,10 +37,20 @@ function redirectWithInstallCookies(
 
 export async function GET(req: NextRequest): Promise<Response> {
   const session = await getServerSession();
-  const redirectTo = sanitizeRedirectTo(req.nextUrl.searchParams.get("next"));
+  const redirectTo = sanitizeInternalRedirect(
+    req.nextUrl.searchParams.get("next"),
+    "/get-started",
+    req.url,
+  );
 
   if (!session?.user?.id) {
     return NextResponse.redirect(new URL("/", req.url));
+  }
+
+  if (isManagedTemplateTrialUser(session, req.url)) {
+    const fallbackUrl = new URL(redirectTo, req.url);
+    fallbackUrl.searchParams.set("github", "trial_blocked");
+    return NextResponse.redirect(fallbackUrl);
   }
 
   const appSlug = process.env.NEXT_PUBLIC_GITHUB_APP_SLUG;

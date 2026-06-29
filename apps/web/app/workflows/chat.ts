@@ -11,52 +11,77 @@ import {
 import type { OpenAgentCallOptions } from "@open-agents/agent";
 import { getWorkflowMetadata, getWritable } from "workflow";
 import { getRun } from "workflow/api";
+import { assistantFileLinkPrompt } from "@/lib/assistant-file-links";
 import { addLanguageModelUsage } from "./usage-utils";
 import { extractGatewayCost } from "./gateway-metadata";
 import type {
   WebAgentCommitData,
+  WebAgentCommitDataPart,
   WebAgentMessageMetadata,
   WebAgentPrData,
+  WebAgentPrDataPart,
   WebAgentStepFinishMetadata,
   WebAgentUIMessage,
 } from "@/app/types";
 import {
   claimActiveStream,
+  closeStream,
   clearActiveStream,
   hasAutoCommitChangesStep,
   persistAssistantMessage,
+  persistAssistantMessageWithToolResults,
   persistSandboxState,
+  persistUserMessage,
   recordWorkflowUsage,
   refreshDiffCache,
   refreshLifecycleActivity,
   runAutoCommitStep,
   runAutoCreatePrStep,
+  sendFinish,
 } from "./chat-post-finish";
 import { dedupeMessageReasoning } from "@/lib/chat/dedupe-message-reasoning";
+import { getChatById, getSessionById } from "@/lib/db/sessions";
+import { getUserPreferences } from "@/lib/db/user-preferences";
+import {
+  filterModelVariantsForSession,
+  sanitizeSelectedModelIdForSession,
+  sanitizeUserPreferencesForSession,
+} from "@/lib/model-access";
+import { getAllVariants } from "@/lib/model-variants";
+import { APP_DEFAULT_MODEL_ID } from "@/lib/models";
+import type { Session as AuthSession } from "@/lib/session/types";
 import type {
   WorkflowRunStatus,
   WorkflowRunStepTiming,
 } from "@/lib/db/workflow-runs";
+import { resolveChatModelSelection } from "../api/chat/_lib/model-selection";
+import { resolveChatSandboxRuntime } from "./chat-sandbox-runtime";
+
+type AuthSessionContext = Pick<AuthSession, "authProvider" | "user"> | null;
 
 type Options = {
   messages: WebAgentUIMessage[];
   chatId: string;
   sessionId: string;
   userId: string;
+  requestUrl: string;
+  authSession: AuthSessionContext;
+  selectedModelId?: string;
+  modelId?: string;
+  agentOptions?: Omit<OpenAgentCallOptions, "sandbox" | "skills">;
+  assistantId?: string;
+  inputMessagesPersisted?: boolean;
+  maxSteps?: number;
+  autoCommitEnabled?: boolean;
+  autoCreatePrEnabled?: boolean;
+};
+
+type ChatModelRuntime = {
   selectedModelId: string;
   modelId: string;
-  agentOptions: OpenAgentCallOptions;
-  maxSteps?: number;
-  /** Whether auto-commit+push should run after a natural finish. */
-  autoCommitEnabled?: boolean;
-  /** Whether auto PR creation should run after auto-commit on a natural finish. */
-  autoCreatePrEnabled?: boolean;
-  /** Session title for commit message generation. */
-  sessionTitle?: string;
-  /** GitHub repo owner (required for auto-commit and diff refresh). */
-  repoOwner?: string;
-  /** GitHub repo name (required for auto-commit). */
-  repoName?: string;
+  agentOptions: Omit<OpenAgentCallOptions, "sandbox" | "skills">;
+  autoCommitEnabled: boolean;
+  autoCreatePrEnabled: boolean;
 };
 
 type Writable = WritableStream<UIMessageChunk>;
@@ -67,6 +92,23 @@ const shouldPauseForToolInteraction = (parts: WebAgentUIMessage["parts"]) =>
       isToolUIPart(part) &&
       (part.state === "input-available" || part.state === "approval-requested"),
   );
+
+const DIFF_REFRESHING_TOOL_TYPES = new Set([
+  "tool-write",
+  "tool-edit",
+  "tool-bash",
+]);
+
+function shouldRefreshDiffCacheForParts(
+  parts: WebAgentUIMessage["parts"],
+): boolean {
+  return parts.some(
+    (part) =>
+      isToolUIPart(part) &&
+      DIFF_REFRESHING_TOOL_TYPES.has(part.type) &&
+      (part.state === "output-available" || part.state === "output-error"),
+  );
+}
 
 const convertMessages = async (
   messages: WebAgentUIMessage[],
@@ -84,7 +126,7 @@ const convertMessages = async (
           const { filename, content } = part.data;
           return {
             type: "text",
-            text: `<snippet filename="${filename}">\n${content}\n</snippet>`,
+            text: JSON.stringify({ type: "snippet", filename, content }),
           };
         }
         return undefined;
@@ -98,10 +140,112 @@ const convertMessages = async (
   });
 };
 
-const generateId = async () => {
+async function resolveChatModelRuntime(params: {
+  userId: string;
+  sessionId: string;
+  chatId: string;
+  requestUrl: string;
+  authSession: AuthSessionContext;
+}): Promise<ChatModelRuntime> {
   "use step";
-  return generateIdAi();
-};
+
+  const [sessionRecord, chat, rawPreferences] = await Promise.all([
+    getSessionById(params.sessionId),
+    getChatById(params.chatId),
+    getUserPreferences(params.userId).catch((error) => {
+      console.error("Failed to load user preferences:", error);
+      return null;
+    }),
+  ]);
+
+  if (!sessionRecord) {
+    throw new Error("Session not found");
+  }
+  if (sessionRecord.userId !== params.userId) {
+    throw new Error("Unauthorized");
+  }
+  if (!chat || chat.sessionId !== params.sessionId) {
+    throw new Error("Chat not found");
+  }
+
+  const preferences = rawPreferences
+    ? sanitizeUserPreferencesForSession(
+        rawPreferences,
+        params.authSession,
+        params.requestUrl,
+      )
+    : null;
+  const modelVariants = filterModelVariantsForSession(
+    getAllVariants(preferences?.modelVariants ?? []),
+    params.authSession,
+    params.requestUrl,
+  );
+  const selectedModelId =
+    sanitizeSelectedModelIdForSession(
+      chat.modelId,
+      modelVariants,
+      params.authSession,
+      params.requestUrl,
+    ) ??
+    chat.modelId ??
+    null;
+  const mainModelSelection = resolveChatModelSelection({
+    selectedModelId,
+    modelVariants,
+    missingVariantLabel: "Selected model variant",
+  });
+  const subagentModelSelection = preferences?.defaultSubagentModelId
+    ? resolveChatModelSelection({
+        selectedModelId: sanitizeSelectedModelIdForSession(
+          preferences.defaultSubagentModelId,
+          modelVariants,
+          params.authSession,
+          params.requestUrl,
+        ),
+        modelVariants,
+        missingVariantLabel: "Subagent model variant",
+      })
+    : undefined;
+  const autoCommitEnabled =
+    (sessionRecord.autoCommitPushOverride ??
+      preferences?.autoCommitPush ??
+      false) &&
+    Boolean(sessionRecord.repoOwner && sessionRecord.repoName);
+  const autoCreatePrEnabled =
+    autoCommitEnabled &&
+    (sessionRecord.autoCreatePrOverride ?? preferences?.autoCreatePr ?? false);
+
+  return {
+    selectedModelId: selectedModelId ?? mainModelSelection.id,
+    modelId: mainModelSelection.id,
+    agentOptions: {
+      model: mainModelSelection,
+      ...(subagentModelSelection
+        ? { subagentModel: subagentModelSelection }
+        : {}),
+      customInstructions: assistantFileLinkPrompt,
+    },
+    autoCommitEnabled,
+    autoCreatePrEnabled,
+  };
+}
+
+async function persistInputMessages(
+  chatId: string,
+  messages: WebAgentUIMessage[],
+): Promise<void> {
+  "use step";
+
+  const latestMessage = messages[messages.length - 1];
+  if (!latestMessage) {
+    return;
+  }
+
+  await Promise.all([
+    persistUserMessage(chatId, latestMessage),
+    persistAssistantMessageWithToolResults(chatId, latestMessage),
+  ]);
+}
 
 function buildStepTiming(
   stepNumber: number,
@@ -130,6 +274,22 @@ function withModelMetadata(
     selectedModelId,
     modelId,
   };
+}
+
+function getSetupErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "Workspace setup failed. Try again in a moment.";
+  }
+
+  if (error.message.includes("Connect GitHub")) {
+    return "Connect GitHub to access this repository, then try again.";
+  }
+
+  if (error.message === "Session is archived") {
+    return "This session is archived. Unarchive it to continue.";
+  }
+
+  return "Workspace setup failed. Try again in a moment.";
 }
 
 function isStepTimingError(
@@ -397,17 +557,7 @@ function buildPrData(
 
 function upsertAssistantDataPart(
   message: WebAgentUIMessage,
-  part:
-    | {
-        type: "data-commit";
-        id: string;
-        data: WebAgentCommitData;
-      }
-    | {
-        type: "data-pr";
-        id: string;
-        data: WebAgentPrData;
-      },
+  part: WebAgentCommitDataPart | WebAgentPrDataPart,
 ): WebAgentUIMessage {
   const nextParts = [...message.parts];
   const existingIndex = nextParts.findIndex(
@@ -429,17 +579,7 @@ function upsertAssistantDataPart(
 
 async function sendDataPart(
   writable: Writable,
-  part:
-    | {
-        type: "data-commit";
-        id: string;
-        data: WebAgentCommitData;
-      }
-    | {
-        type: "data-pr";
-        id: string;
-        data: WebAgentPrData;
-      },
+  part: WebAgentCommitDataPart | WebAgentPrDataPart,
 ) {
   "use step";
   const writer = writable.getWriter();
@@ -462,6 +602,27 @@ export async function runAgentWorkflow(options: Options) {
     throw new Error("runAgentWorkflow requires at least one message");
   }
 
+  const assistantId =
+    latestMessage.role === "assistant"
+      ? latestMessage.id
+      : (options.assistantId ?? generateIdAi());
+
+  const modelMessagesPromise = convertMessages(options.messages);
+  const inputMessagesPersistPromise = options.inputMessagesPersisted
+    ? Promise.resolve()
+    : persistInputMessages(options.chatId, options.messages);
+  const modelRuntimePromise = resolveChatModelRuntime({
+    userId: options.userId,
+    sessionId: options.sessionId,
+    chatId: options.chatId,
+    requestUrl: options.requestUrl,
+    authSession: options.authSession,
+  });
+  const runtimePromise = resolveChatSandboxRuntime({
+    userId: options.userId,
+    sessionId: options.sessionId,
+  });
+
   // Self-register this workflow's runId onto the chat as the very first step.
   // The HTTP POST handler also writes this (via compareAndSetChatActiveStreamId
   // after `start()` returns), but that write is best-effort and can be lost
@@ -469,24 +630,29 @@ export async function runAgentWorkflow(options: Options) {
   // it runs. Persisting from inside the workflow guarantees that as long as
   // the workflow is running, the chat row points at it and the client can
   // resume on refresh.
-  const activeStreamClaim = await claimActiveStream(
+  const activeStreamClaimPromise = claimActiveStream(
     options.chatId,
     workflowRunId,
+    writable,
+    assistantId,
   );
+  const activeStreamClaim = await activeStreamClaimPromise;
   if (activeStreamClaim === "conflict") {
     // Another workflow claimed the slot while this run was queued or starting.
     // Exit before emitting chunks or persisting messages so only the owning
     // workflow can mutate this chat.
+    await Promise.allSettled([
+      runtimePromise,
+      modelMessagesPromise,
+      inputMessagesPersistPromise,
+      modelRuntimePromise,
+    ]);
     await closeStream(writable);
     return;
   }
 
-  const [modelMessages, assistantId] = await Promise.all([
-    convertMessages(options.messages),
-    latestMessage.role === "assistant"
-      ? Promise.resolve(latestMessage.id)
-      : generateId(),
-  ]);
+  let selectedModelId = APP_DEFAULT_MODEL_ID;
+  let modelId = APP_DEFAULT_MODEL_ID;
 
   let pendingAssistantResponse: WebAgentUIMessage =
     latestMessage.role === "assistant"
@@ -494,8 +660,8 @@ export async function runAgentWorkflow(options: Options) {
           ...latestMessage,
           metadata: withModelMetadata(
             latestMessage.metadata,
-            options.selectedModelId,
-            options.modelId,
+            selectedModelId,
+            modelId,
           ),
           parts: [...latestMessage.parts],
         }
@@ -503,16 +669,10 @@ export async function runAgentWorkflow(options: Options) {
           role: "assistant",
           id: assistantId,
           parts: [],
-          metadata: withModelMetadata(
-            undefined,
-            options.selectedModelId,
-            options.modelId,
-          ),
+          metadata: withModelMetadata(undefined, selectedModelId, modelId),
         };
 
   let originalMessagesForStep: WebAgentUIMessage[] = [latestMessage];
-
-  await sendStart(writable, assistantId);
 
   const runStartedAt = new Date();
   const previousResponseMessage =
@@ -525,9 +685,41 @@ export async function runAgentWorkflow(options: Options) {
   let streamClosed = false;
   let workflowStatus: WorkflowRunStatus = "completed";
   let caughtError: unknown;
-  const sandboxState = options.agentOptions.sandbox?.state;
+  let sandboxState: OpenAgentCallOptions["sandbox"]["state"] | undefined;
+  let shouldRefreshCachedDiff = false;
 
   try {
+    const [, runtime, modelRuntime, modelMessages] = await Promise.all([
+      activeStreamClaimPromise,
+      runtimePromise,
+      modelRuntimePromise,
+      modelMessagesPromise,
+      inputMessagesPersistPromise,
+    ]);
+    selectedModelId = options.selectedModelId ?? modelRuntime.selectedModelId;
+    modelId = options.modelId ?? modelRuntime.modelId;
+    pendingAssistantResponse = {
+      ...pendingAssistantResponse,
+      metadata: withModelMetadata(
+        pendingAssistantResponse.metadata,
+        selectedModelId,
+        modelId,
+      ),
+    };
+
+    const agentOptions: OpenAgentCallOptions = {
+      ...modelRuntime.agentOptions,
+      ...options.agentOptions,
+      sandbox: {
+        state: runtime.sandboxState,
+        workingDirectory: runtime.workingDirectory,
+        currentBranch: runtime.currentBranch,
+        environmentDetails: runtime.environmentDetails,
+      },
+      ...(runtime.skills.length > 0 ? { skills: runtime.skills } : {}),
+    };
+    sandboxState = runtime.sandboxState;
+
     for (
       let step = 0;
       options.maxSteps === undefined || step < options.maxSteps;
@@ -544,9 +736,9 @@ export async function runAgentWorkflow(options: Options) {
           workflowRunId,
           options.chatId,
           options.sessionId,
-          options.selectedModelId,
-          options.modelId,
-          options.agentOptions,
+          selectedModelId,
+          modelId,
+          agentOptions,
           step + 1,
         );
       } catch (error) {
@@ -559,6 +751,9 @@ export async function runAgentWorkflow(options: Options) {
       stepTimings.push(result.stepTiming);
       pendingAssistantResponse =
         result.responseMessage ?? pendingAssistantResponse;
+      shouldRefreshCachedDiff =
+        shouldRefreshCachedDiff ||
+        shouldRefreshDiffCacheForParts(pendingAssistantResponse.parts);
       originalMessagesForStep = [pendingAssistantResponse];
       modelMessages.push(...result.responseMessages);
       wasAborted = wasAborted || result.stepWasAborted;
@@ -600,14 +795,14 @@ export async function runAgentWorkflow(options: Options) {
       };
     }
 
-    // Persist the assistant message immediately so completed model output is not
-    // lost if later post-finish work fails.
-    await persistAssistantMessage(options.chatId, pendingAssistantResponse);
-
-    // Persist the sandbox state so lifecycle timers stay accurate.
-    if (sandboxState) {
-      await persistSandboxState(options.sessionId, sandboxState);
-    }
+    // Persist completed model output before post-finish work so it is not lost
+    // if later automation fails. Sandbox state can persist in parallel.
+    await Promise.all([
+      persistAssistantMessage(options.chatId, pendingAssistantResponse),
+      ...(sandboxState
+        ? [persistSandboxState(options.sessionId, sandboxState)]
+        : []),
+    ]);
 
     const finishedNaturally =
       !wasAborted &&
@@ -615,8 +810,8 @@ export async function runAgentWorkflow(options: Options) {
       finalFinishReason !== "tool-calls";
     const commitPartId = `${assistantId}:commit`;
     const prPartId = `${assistantId}:pr`;
-    const repoOwner = options.repoOwner;
-    const repoName = options.repoName;
+    const repoOwner = runtime.repoOwner;
+    const repoName = runtime.repoName;
     let didUpdateGitData = false;
 
     let autoCommitResult: Awaited<ReturnType<typeof runAutoCommitStep>> | null =
@@ -624,7 +819,7 @@ export async function runAgentWorkflow(options: Options) {
 
     const canAutoCommit =
       finishedNaturally &&
-      options.autoCommitEnabled &&
+      (options.autoCommitEnabled ?? modelRuntime.autoCommitEnabled) &&
       sandboxState != null &&
       repoOwner != null &&
       repoName != null;
@@ -635,36 +830,27 @@ export async function runAgentWorkflow(options: Options) {
       });
 
       if (hasAutoCommitChanges) {
-        const pendingCommitPart = {
-          type: "data-commit" as const,
+        const pendingCommitPart: WebAgentCommitDataPart = {
+          type: "data-commit",
           id: commitPartId,
-          data: { status: "pending" as const },
+          data: { status: "pending" },
         };
         pendingAssistantResponse = upsertAssistantDataPart(
           pendingAssistantResponse,
           pendingCommitPart,
         );
         await sendDataPart(writable, pendingCommitPart);
-        didUpdateGitData = true;
-      }
+        autoCommitResult = await runAutoCommitStep({
+          userId: options.userId,
+          sessionId: options.sessionId,
+          sessionTitle: runtime.sessionTitle,
+          repoOwner,
+          repoName,
+          sandboxState,
+        });
 
-      autoCommitResult = hasAutoCommitChanges
-        ? await runAutoCommitStep({
-            userId: options.userId,
-            sessionId: options.sessionId,
-            sessionTitle: options.sessionTitle ?? "",
-            repoOwner,
-            repoName,
-            sandboxState,
-          })
-        : {
-            committed: false,
-            pushed: false,
-          };
-
-      if (hasAutoCommitChanges) {
-        const resolvedCommitPart = {
-          type: "data-commit" as const,
+        const resolvedCommitPart: WebAgentCommitDataPart = {
+          type: "data-commit",
           id: commitPartId,
           data: buildCommitData(autoCommitResult, repoOwner, repoName),
         };
@@ -673,6 +859,13 @@ export async function runAgentWorkflow(options: Options) {
           resolvedCommitPart,
         );
         await sendDataPart(writable, resolvedCommitPart);
+        didUpdateGitData = true;
+        shouldRefreshCachedDiff = true;
+      } else {
+        autoCommitResult = {
+          committed: false,
+          pushed: false,
+        };
       }
     }
 
@@ -681,31 +874,32 @@ export async function runAgentWorkflow(options: Options) {
       !autoCommitResult.error &&
       (autoCommitResult.pushed || !autoCommitResult.committed);
 
-    if (canAutoCommit && options.autoCreatePrEnabled) {
+    if (
+      canAutoCommit &&
+      (options.autoCreatePrEnabled ?? modelRuntime.autoCreatePrEnabled)
+    ) {
       if (canAutoCreatePr) {
-        const pendingPrPart = {
-          type: "data-pr" as const,
+        const pendingPrPart: WebAgentPrDataPart = {
+          type: "data-pr",
           id: prPartId,
-          data: { status: "pending" as const },
+          data: { status: "pending" },
         };
         pendingAssistantResponse = upsertAssistantDataPart(
           pendingAssistantResponse,
           pendingPrPart,
         );
         await sendDataPart(writable, pendingPrPart);
-        didUpdateGitData = true;
-
         const autoPrResult = await runAutoCreatePrStep({
           userId: options.userId,
           sessionId: options.sessionId,
-          sessionTitle: options.sessionTitle ?? "",
+          sessionTitle: runtime.sessionTitle,
           repoOwner,
           repoName,
           sandboxState,
         });
 
-        const resolvedPrPart = {
-          type: "data-pr" as const,
+        const resolvedPrPart: WebAgentPrDataPart = {
+          type: "data-pr",
           id: prPartId,
           data: buildPrData(autoPrResult),
         };
@@ -714,12 +908,14 @@ export async function runAgentWorkflow(options: Options) {
           resolvedPrPart,
         );
         await sendDataPart(writable, resolvedPrPart);
+        didUpdateGitData = true;
+        shouldRefreshCachedDiff = true;
       } else {
-        const skippedPrPart = {
-          type: "data-pr" as const,
+        const skippedPrPart: WebAgentPrDataPart = {
+          type: "data-pr",
           id: prPartId,
           data: {
-            status: "skipped" as const,
+            status: "skipped",
             skipReason:
               autoCommitResult?.error ??
               "Auto-commit did not leave origin in sync with HEAD",
@@ -741,13 +937,11 @@ export async function runAgentWorkflow(options: Options) {
     await Promise.all([
       clearActiveStream(options.chatId, workflowRunId),
       sendFinish(writable).then(() => closeStream(writable)),
+      ...(sandboxState && shouldRefreshCachedDiff
+        ? [refreshDiffCache(options.sessionId, sandboxState)]
+        : []),
     ]);
     streamClosed = true;
-
-    // Refresh the diff cache so the UI shows current changes.
-    if (sandboxState) {
-      await refreshDiffCache(options.sessionId, sandboxState);
-    }
 
     workflowStatus = wasAborted
       ? "aborted"
@@ -757,6 +951,16 @@ export async function runAgentWorkflow(options: Options) {
   } catch (error) {
     workflowStatus = wasAborted ? "aborted" : "failed";
     caughtError = error;
+
+    if (pendingAssistantResponse.parts.length === 0 && !streamClosed) {
+      const errorText = getSetupErrorMessage(error);
+      pendingAssistantResponse = {
+        ...pendingAssistantResponse,
+        parts: [{ type: "text", text: errorText }],
+      };
+      await sendTextMessage(writable, "setup-error", errorText);
+      await persistAssistantMessage(options.chatId, pendingAssistantResponse);
+    }
   } finally {
     try {
       // On unexpected errors, still clear the active stream and close
@@ -771,7 +975,7 @@ export async function runAgentWorkflow(options: Options) {
       const runFinishedAt = new Date();
       await recordWorkflowUsage(
         options.userId,
-        options.modelId,
+        modelId,
         totalUsage,
         pendingAssistantResponse,
         previousResponseMessage,
@@ -1109,27 +1313,14 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
 }
 
-async function sendStart(writable: Writable, messageId: string) {
+async function sendTextMessage(writable: Writable, id: string, text: string) {
   "use step";
   const writer = writable.getWriter();
   try {
-    await writer.write({ type: "start", messageId });
+    await writer.write({ type: "text-start", id });
+    await writer.write({ type: "text-delta", id, delta: text });
+    await writer.write({ type: "text-end", id });
   } finally {
     writer.releaseLock();
   }
-}
-
-async function sendFinish(writable: Writable) {
-  "use step";
-  const writer = writable.getWriter();
-  try {
-    await writer.write({ type: "finish", finishReason: "stop" });
-  } finally {
-    writer.releaseLock();
-  }
-}
-
-async function closeStream(writable: Writable) {
-  "use step";
-  await writable.close();
 }

@@ -24,13 +24,21 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DiffFile } from "@/app/api/sessions/[sessionId]/diff/route";
 import type { WebAgentUIMessage } from "@/app/types";
-import type { MergeReadinessResponse } from "@/app/api/sessions/[sessionId]/merge-readiness/route";
-import type { MergePullRequestResponse } from "@/app/api/sessions/[sessionId]/merge/route";
+import { createBranch } from "@/lib/git/actions/branch";
+import { discardChanges } from "@/lib/git/actions/discard";
+import { commitChanges } from "@/lib/github/actions/commit";
+import {
+  generatePrContent,
+  openPullRequest,
+  mergePr,
+  type MergePullRequestResult,
+} from "@/lib/github/actions/pr";
+import {
+  getMergeReadiness,
+  type MergeReadinessResponse,
+} from "@/lib/github/queries/pr";
 import type { Session } from "@/lib/db/schema";
-import type {
-  PullRequestCheckRun,
-  PullRequestMergeMethod,
-} from "@/lib/github/client";
+import type { CheckRun, MergeMethod } from "@/lib/github/pulls";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -62,13 +70,7 @@ import {
   shouldPollMergeReadiness,
 } from "@/lib/merge-readiness-polling";
 import { cn } from "@/lib/utils";
-import {
-  commitAndPushSessionChanges,
-  createSessionBranch,
-  discardSessionUncommittedChanges,
-  fetchRepoBranches,
-  generatePullRequestContent,
-} from "@/lib/git-flow-client";
+import { fetchRepoBranches } from "@/lib/git/branches";
 import type { SessionGitStatus } from "@/hooks/use-session-git-status";
 import { useSessionFiles } from "@/hooks/use-session-files";
 import { useGitHubConnectionStatus } from "@/hooks/use-github-connection-status";
@@ -80,23 +82,26 @@ import { useSessionChatWorkspaceContext } from "./session-chat-context";
 /* Merge method labels / descriptions                                  */
 /* ------------------------------------------------------------------ */
 
-const mergeMethodLabels: Record<PullRequestMergeMethod, string> = {
+const mergeMethodLabels: Record<MergeMethod, string> = {
   squash: "Squash and merge",
   merge: "Create a merge commit",
   rebase: "Rebase and merge",
 };
 
-const mergeMethodButtonLabels: Record<PullRequestMergeMethod, string> = {
+const mergeMethodButtonLabels: Record<MergeMethod, string> = {
   squash: "Squash & Archive",
   merge: "Merge & Archive",
   rebase: "Rebase & Archive",
 };
 
-const mergeMethodDescriptions: Record<PullRequestMergeMethod, string> = {
+const mergeMethodDescriptions: Record<MergeMethod, string> = {
   squash: "Combine all commits into one commit in the base branch.",
   merge: "All commits will be added to the base branch via a merge commit.",
   rebase: "All commits will be rebased and added to the base branch.",
 };
+
+const createRepoDisabledReason =
+  "Creating repositories from Open Agents is temporarily disabled. Create the repository on GitHub first, then connect it to a session.";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -131,9 +136,9 @@ type GitPanelProps = {
   refreshDiff: () => Promise<void>;
 
   // Merge
-  onMerged: (result: MergePullRequestResponse) => Promise<void> | void;
+  onMerged: (result: MergePullRequestResult) => Promise<void> | void;
   onCloseAndArchiveClick: () => void;
-  onFixChecks?: (failedRuns: PullRequestCheckRun[]) => Promise<void> | void;
+  onFixChecks?: (failedRuns: CheckRun[]) => Promise<void> | void;
   onFixConflicts?: (baseBranchRef: string) => Promise<void> | void;
 
   // For inline commit
@@ -141,7 +146,7 @@ type GitPanelProps = {
   gitStatus: SessionGitStatus | null;
   gitStatusLoading: boolean;
   refreshGitStatus: () => Promise<SessionGitStatus | undefined>;
-  onCommitted?: () => void;
+  onCommitted?: () => Promise<void> | void;
   isAgentWorking: boolean;
 
   // For inline PR creation
@@ -319,6 +324,7 @@ function InlineCommitPanel({
   gitStatus,
   refreshGitStatus,
   onCommitted,
+  onGitMessage,
   isAgentWorking,
   baseBranch,
   connectionStatus,
@@ -328,7 +334,8 @@ function InlineCommitPanel({
   hasSandbox: boolean;
   gitStatus: SessionGitStatus | null;
   refreshGitStatus: () => Promise<SessionGitStatus | undefined>;
-  onCommitted?: () => void;
+  onCommitted?: () => Promise<void> | void;
+  onGitMessage?: (message: WebAgentUIMessage) => Promise<void> | void;
   isAgentWorking: boolean;
   baseBranch: string;
   connectionStatus: string | null;
@@ -375,7 +382,7 @@ function InlineCommitPanel({
     setIsCreatingBranch(true);
     setCommitError(null);
     try {
-      const result = await createSessionBranch({
+      const result = await createBranch({
         sessionId: session.id,
         sessionTitle: session.title,
         baseBranch,
@@ -416,49 +423,107 @@ function InlineCommitPanel({
     }
   };
 
-  const handleCommit = async (skipPush = false) => {
+  const handleCommit = async () => {
     if (!hasSandbox || !hasPendingGitWork) return;
     setIsCommitting(true);
     setCommitError(null);
     setCommitSuccess(null);
 
+    const gitMessageId = crypto.randomUUID();
+    const commitPartId = `${gitMessageId}:commit`;
+
     try {
+      await onGitMessage?.({
+        id: gitMessageId,
+        role: "assistant",
+        metadata: {},
+        parts: [
+          {
+            type: "data-commit",
+            id: commitPartId,
+            data: { status: "pending" },
+          },
+        ],
+      });
+
       const trimmed = commitMessage.trim();
       const lines = trimmed.split("\n");
       const commitTitle = lines[0] ?? "";
       const commitBody = lines.slice(1).join("\n").trim();
 
-      const response = await commitAndPushSessionChanges({
+      const result = await commitChanges({
         sessionId: session.id,
         sessionTitle: session.title,
         baseBranch,
         branchName: displayBranch,
         ...(commitTitle ? { commitTitle, commitBody } : {}),
-        skipPush,
       });
 
-      if (response.branchName && response.branchName !== "HEAD") {
-        setResolvedBranch(response.branchName);
+      if (result.error) {
+        throw new Error(result.error);
+      }
+
+      if (result.branchName && result.branchName !== "HEAD") {
+        setResolvedBranch(result.branchName);
       }
 
       setCommitSuccess({
-        commitSha: response.gitActions?.commitSha,
-        commitMessage:
-          response.gitActions?.commitMessage ??
-          (skipPush ? "Changes committed" : "Changes committed & pushed"),
+        commitSha: result.commitSha,
+        commitMessage: result.commitMessage ?? "Changes committed & pushed",
       });
       setCommitMessage("");
 
-      onCommitted?.();
+      const commitUrl =
+        result.commitSha && session.repoOwner && session.repoName
+          ? `https://github.com/${session.repoOwner}/${session.repoName}/commit/${result.commitSha}`
+          : undefined;
+
+      await onGitMessage?.({
+        id: gitMessageId,
+        role: "assistant",
+        metadata: {},
+        parts: [
+          {
+            type: "data-commit",
+            id: commitPartId,
+            data: {
+              status: "success",
+              committed: result.committed,
+              pushed: result.pushed,
+              commitMessage: result.commitMessage,
+              commitSha: result.commitSha,
+              url: commitUrl,
+            },
+          },
+        ],
+      });
+
+      await refreshGitStatus().catch(() => undefined);
+      await onCommitted?.();
 
       // Clear success after 3 seconds
       successTimeoutRef.current = setTimeout(() => {
         setCommitSuccess(null);
       }, 3000);
     } catch (err) {
-      setCommitError(
-        err instanceof Error ? err.message : "Failed to commit and push",
-      );
+      const errorMessage =
+        err instanceof Error ? err.message : "Failed to commit and push";
+      await onGitMessage?.({
+        id: gitMessageId,
+        role: "assistant",
+        metadata: {},
+        parts: [
+          {
+            type: "data-commit",
+            id: commitPartId,
+            data: {
+              status: "error",
+              error: errorMessage,
+            },
+          },
+        ],
+      });
+      setCommitError(errorMessage);
     } finally {
       setIsCommitting(false);
     }
@@ -550,51 +615,28 @@ function InlineCommitPanel({
         </div>
       ) : (
         <>
-          <div className="flex w-full">
-            <Button
-              size="sm"
-              className="min-w-0 flex-1 rounded-r-none text-xs"
-              onClick={() => void handleCommit()}
-              disabled={commitDisabled}
-            >
-              {isCommitting ? (
-                <>
-                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                  Committing...
-                </>
-              ) : (
-                <>
-                  {isExpanded ? (
-                    <GitCommit className="mr-1.5 h-3.5 w-3.5" />
-                  ) : (
-                    <Sparkles className="mr-1.5 h-3.5 w-3.5" />
-                  )}
-                  Commit & Push
-                </>
-              )}
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="default"
-                  size="icon"
-                  className="h-8 w-8 rounded-l-none border-l border-l-primary-foreground/25"
-                  disabled={commitDisabled}
-                  aria-label="Commit options"
-                >
-                  <ChevronDown className="h-3.5 w-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="min-w-[10rem]">
-                <DropdownMenuItem
-                  onSelect={() => void handleCommit(true)}
-                  className="gap-2 text-xs"
-                >
-                  Commit only
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+          <Button
+            size="sm"
+            className="w-full text-xs"
+            onClick={() => void handleCommit()}
+            disabled={commitDisabled}
+          >
+            {isCommitting ? (
+              <>
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                Committing...
+              </>
+            ) : (
+              <>
+                {commitMessage.trim() ? (
+                  <GitCommit className="mr-1.5 h-3.5 w-3.5" />
+                ) : (
+                  <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                Commit & Push
+              </>
+            )}
+          </Button>
           {!isExpanded && (
             <button
               type="button"
@@ -699,7 +741,7 @@ function InlinePrCreatePanel({
     setIsCreatingBranch(true);
     setPrError(null);
     try {
-      const result = await createSessionBranch({
+      const result = await createBranch({
         sessionId: session.id,
         sessionTitle: session.title,
         baseBranch,
@@ -724,20 +766,28 @@ function InlinePrCreatePanel({
 
   const handleGenerateContent = async () => {
     setIsGenerating(true);
+    setPrError(null);
     try {
-      const generated = await generatePullRequestContent({
+      const generated = await generatePrContent({
         sessionId: session.id,
         sessionTitle: session.title,
         baseBranch,
         branchName: displayBranch,
       });
+      if (generated.error) {
+        throw new Error(generated.error);
+      }
       setPrTitle(generated.title ?? session.title);
       setPrBody(generated.body ?? "");
       if (generated.branchName && generated.branchName !== "HEAD") {
         setResolvedBranch(generated.branchName);
       }
-    } catch {
-      // silently fail
+    } catch (err) {
+      setPrError(
+        err instanceof Error
+          ? err.message
+          : "Failed to generate pull request content",
+      );
     } finally {
       setIsGenerating(false);
     }
@@ -758,12 +808,15 @@ function InlinePrCreatePanel({
       if (!finalTitle) {
         setIsGenerating(true);
         try {
-          const generated = await generatePullRequestContent({
+          const generated = await generatePrContent({
             sessionId: session.id,
             sessionTitle: session.title,
             baseBranch,
             branchName: displayBranch,
           });
+          if (generated.error) {
+            throw new Error(generated.error);
+          }
           finalTitle = generated.title ?? session.title;
           finalBody = finalBody || (generated.body ?? "");
           if (generated.branchName && generated.branchName !== "HEAD") {
@@ -788,29 +841,23 @@ function InlinePrCreatePanel({
         ],
       });
 
-      const res = await fetch("/api/pr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: session.id,
-          repoUrl: session.cloneUrl,
-          branchName: displayBranch,
-          title: finalTitle,
-          body: finalBody,
-          baseBranch,
-          isDraft,
-          enableAutoMerge: !isDraft && enableAutoMerge,
-        }),
+      const data = await openPullRequest({
+        sessionId: session.id,
+        repoUrl: session.cloneUrl ?? "",
+        branchName: displayBranch,
+        title: finalTitle,
+        body: finalBody,
+        baseBranch,
+        isDraft,
+        shouldAutoMerge: !isDraft && enableAutoMerge,
       });
 
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to create PR");
+      if (data.error) {
+        throw new Error(data.error);
       }
 
       setPrSuccess({
-        prUrl: data.prUrl,
+        prUrl: data.prUrl ?? "",
         requiresManualCreation: Boolean(data.requiresManualCreation),
         isDraft,
         autoMergeEnabled: Boolean(data.autoMergeEnabled),
@@ -1052,7 +1099,7 @@ function InlinePrCreatePanel({
             </>
           ) : (
             <>
-              {isExpanded ? (
+              {prTitle.trim() ? (
                 <GitPullRequest className="mr-1.5 h-3.5 w-3.5" />
               ) : (
                 <Sparkles className="mr-1.5 h-3.5 w-3.5" />
@@ -1128,18 +1175,17 @@ function InlineMergePanel({
   isAgentWorking,
 }: {
   session: Session;
-  onMerged: (result: MergePullRequestResponse) => Promise<void> | void;
+  onMerged: (result: MergePullRequestResult) => Promise<void> | void;
   onCloseAndArchiveClick: () => void;
   canCloseAndArchive: boolean;
-  onFixChecks?: (failedRuns: PullRequestCheckRun[]) => Promise<void> | void;
+  onFixChecks?: (failedRuns: CheckRun[]) => Promise<void> | void;
   onFixConflicts?: (baseBranchRef: string) => Promise<void> | void;
   isAgentWorking: boolean;
 }) {
   const [readiness, setReadiness] = useState<MergeReadinessResponse | null>(
     null,
   );
-  const [mergeMethod, setMergeMethod] =
-    useState<PullRequestMergeMethod>("squash");
+  const [mergeMethod, setMergeMethod] = useState<MergeMethod>("squash");
   const [deleteBranch, setDeleteBranch] = useState(true);
   const [isLoadingReadiness, setIsLoadingReadiness] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -1161,27 +1207,14 @@ function InlineMergePanel({
     setError(null);
 
     try {
-      const response = await fetch(
-        `/api/sessions/${session.id}/merge-readiness`,
-      );
-
-      const payload = (await response.json()) as
-        | MergeReadinessResponse
-        | { error?: string };
-
-      if (!response.ok) {
-        throw new Error(
-          "error" in payload && payload.error
-            ? payload.error
-            : "Failed to load merge readiness",
-        );
-      }
+      const readinessPayload = await getMergeReadiness({
+        sessionId: session.id,
+      });
 
       if (readinessRequestIdRef.current !== requestId) {
         return;
       }
 
-      const readinessPayload = payload as MergeReadinessResponse;
       setReadiness(readinessPayload);
       setMergeMethod((currentMergeMethod) =>
         readinessPayload.allowedMethods.includes(currentMergeMethod)
@@ -1264,41 +1297,14 @@ function InlineMergePanel({
     setError(null);
 
     try {
-      const response = await fetch(`/api/sessions/${session.id}/merge`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": crypto.randomUUID(),
-        },
-        body: JSON.stringify({
-          mergeMethod,
-          deleteBranch,
-          expectedHeadSha: readiness.pr.headSha,
-          ...(force ? { force: true } : {}),
-        }),
+      const mergeResult = await mergePr({
+        sessionId: session.id,
+        mergeMethod,
+        deleteBranch,
+        expectedHeadSha: readiness.pr.headSha ?? undefined,
+        ...(force ? { force: true } : {}),
       });
 
-      const payload = (await response.json()) as
-        | MergePullRequestResponse
-        | { error?: string; reasons?: string[] };
-
-      if (!response.ok) {
-        const reasonsText =
-          "reasons" in payload && Array.isArray(payload.reasons)
-            ? payload.reasons.filter((reason) => typeof reason === "string")
-            : [];
-
-        const fallback =
-          reasonsText.length > 0
-            ? reasonsText.join(". ")
-            : "Failed to merge pull request";
-
-        throw new Error(
-          "error" in payload && payload.error ? payload.error : fallback,
-        );
-      }
-
-      const mergeResult = payload as MergePullRequestResponse;
       if (mergeResult.merged !== true) {
         throw new Error("Failed to merge pull request");
       }
@@ -1709,7 +1715,7 @@ export function GitPanel(props: GitPanelProps) {
     setDiscardError(null);
 
     try {
-      await discardSessionUncommittedChanges({
+      await discardChanges({
         sessionId: session.id,
         ...(discardTarget ? { filePath: discardTarget.filePath } : {}),
         ...(discardTarget?.oldPath ? { oldPath: discardTarget.oldPath } : {}),
@@ -1882,7 +1888,9 @@ export function GitPanel(props: GitPanelProps) {
               size="sm"
               variant="outline"
               className="h-7 text-xs"
+              disabled
               onClick={onCreateRepoClick}
+              title={createRepoDisabledReason}
             >
               <FolderGit2 className="mr-1.5 h-3.5 w-3.5" />
               Create Repo
@@ -1978,6 +1986,7 @@ export function GitPanel(props: GitPanelProps) {
                     gitStatus={gitStatus}
                     refreshGitStatus={refreshGitStatus}
                     onCommitted={onCommitted}
+                    onGitMessage={onGitMessage}
                     isAgentWorking={isAgentWorking}
                     baseBranch={baseBranch}
                     connectionStatus={connectionStatus}

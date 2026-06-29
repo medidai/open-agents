@@ -1,18 +1,14 @@
-import type { Sandbox } from "@open-agents/sandbox";
-import { looksLikeCommitHash } from "@/app/api/generate-pr/_lib/generate-pr-helpers";
+import { withTemporaryGitHubAuth, type Sandbox } from "@open-agents/sandbox";
 import { updateSession } from "@/lib/db/sessions";
+import { looksLikeCommitHash } from "@/lib/git/helpers";
+import { generatePullRequestContentFromSandbox } from "@/lib/github/pr-content";
+import { findPullRequest, openPullRequest } from "@/lib/github/pulls";
+import { fetchGitHubBranches } from "@/lib/github/repos";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import {
-  createPullRequest,
-  findPullRequestByBranch,
-} from "@/lib/github/client";
-import { fetchGitHubBranches } from "@/lib/github/api";
-import {
-  buildGitHubAuthRemoteUrl,
   isValidGitHubRepoName,
   isValidGitHubRepoOwner,
-} from "@/lib/github/repo-identifiers";
-import { resolveGitHubAuth } from "@/lib/github/resolve-token";
-import { generatePullRequestContentFromSandbox } from "@/lib/git/pr-content";
+} from "@/lib/github/urls";
 
 const SAFE_BRANCH_PATTERN = /^[\w\-/.]+$/;
 
@@ -78,10 +74,10 @@ async function findExistingOpenPullRequest(params: {
   repoName: string;
   branchName: string;
   token: string;
-}): Promise<Awaited<ReturnType<typeof findPullRequestByBranch>> | null> {
+}): Promise<Awaited<ReturnType<typeof findPullRequest>> | null> {
   const { repoOwner, repoName, branchName, token } = params;
 
-  const prResult = await findPullRequestByBranch({
+  const prResult = await findPullRequest({
     owner: repoOwner,
     repo: repoName,
     branchName,
@@ -137,6 +133,8 @@ export async function performAutoCreatePr(
     };
   }
 
+  // Resolve a GitHub auth context. Supports users without a linked GitHub
+  // account by falling back to a GitHub App installation token.
   const auth = await resolveGitHubAuth({
     userId,
     owner: repoOwner,
@@ -152,24 +150,6 @@ export async function performAutoCreatePr(
   }
 
   const userToken = auth.token;
-
-  const authUrl = buildGitHubAuthRemoteUrl({
-    token: userToken,
-    owner: repoOwner,
-    repo: repoName,
-  });
-
-  if (!authUrl) {
-    return {
-      created: false,
-      syncedExisting: false,
-      skipped: true,
-      skipReason:
-        "Repository owner or name is not supported for auto PR creation",
-    };
-  }
-
-  await sandbox.exec(`git remote set-url origin "${authUrl}"`, cwd, 10000);
 
   const defaultBranch = await resolveDefaultBranch({
     sandbox,
@@ -205,16 +185,22 @@ export async function performAutoCreatePr(
     };
   }
 
-  await sandbox.exec(
-    `git fetch origin ${defaultBranch}:refs/remotes/origin/${defaultBranch}`,
-    cwd,
-    30000,
-  );
+  const remoteBranchResult = await withTemporaryGitHubAuth(
+    sandbox,
+    userToken,
+    async () => {
+      await sandbox.exec(
+        `git fetch origin ${defaultBranch}:refs/remotes/origin/${defaultBranch}`,
+        cwd,
+        30000,
+      );
 
-  const remoteBranchResult = await sandbox.exec(
-    `git ls-remote --heads origin ${branchName}`,
-    cwd,
-    10000,
+      return sandbox.exec(
+        `git ls-remote --heads origin ${branchName}`,
+        cwd,
+        10000,
+      );
+    },
   );
 
   if (!remoteBranchResult.success || !remoteBranchResult.stdout.trim()) {
@@ -308,7 +294,7 @@ export async function performAutoCreatePr(
   }
 
   const repoUrl = `https://github.com/${repoOwner}/${repoName}`;
-  const createResult = await createPullRequest({
+  const createResult = await openPullRequest({
     repoUrl,
     branchName,
     title: prContentResult.title,

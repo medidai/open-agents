@@ -1,20 +1,14 @@
 import { NextResponse } from "next/server";
-import { getInstallationsByUserId } from "@/lib/db/installations";
-import { getUserGitHubToken, getGitHubUsername } from "@/lib/github/token";
-import { syncUserInstallations } from "@/lib/github/installations-sync";
+import {
+  deleteInstallationsByUserId,
+  getInstallationsByUserId,
+} from "@/lib/db/installations";
+import { getUserGitHubToken } from "@/lib/github/token";
+import { deleteGitHubAccountLink, getGitHubUsername } from "@/lib/github/users";
+import { syncUserInstallations } from "@/lib/github/sync";
+import { isManagedTemplateTrialUser } from "@/lib/managed-template-trial";
+import { sanitizeInternalRedirect } from "@/lib/redirect-safety";
 import { getServerSession } from "@/lib/session/get-server-session";
-
-function sanitizeRedirectTo(rawRedirectTo: string | null | undefined): string {
-  if (!rawRedirectTo) {
-    return "/sessions";
-  }
-
-  if (!rawRedirectTo.startsWith("/") || rawRedirectTo.startsWith("//")) {
-    return "/sessions";
-  }
-
-  return rawRedirectTo;
-}
 
 /**
  * After better-auth completes the GitHub OAuth link, it redirects here.
@@ -27,8 +21,21 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const requestUrl = new URL(req.url);
-  const next = sanitizeRedirectTo(requestUrl.searchParams.get("next"));
+  const next = sanitizeInternalRedirect(
+    requestUrl.searchParams.get("next"),
+    "/sessions",
+    req.url,
+  );
   const redirectUrl = new URL(next, req.url);
+
+  if (isManagedTemplateTrialUser(session, req.url)) {
+    await Promise.all([
+      deleteGitHubAccountLink(session.user.id),
+      deleteInstallationsByUserId(session.user.id),
+    ]);
+    redirectUrl.searchParams.set("github", "trial_blocked");
+    return NextResponse.redirect(redirectUrl);
+  }
 
   const token = await getUserGitHubToken(session.user.id);
   if (!token) {
@@ -47,7 +54,7 @@ export async function GET(req: Request): Promise<Response> {
       );
 
       if (count > 0) {
-        redirectUrl.searchParams.set("github", "connected");
+        redirectUrl.searchParams.set("github", "account_connected");
         return NextResponse.redirect(redirectUrl);
       }
     } catch (error) {
@@ -58,7 +65,7 @@ export async function GET(req: Request): Promise<Response> {
   // no installations found — check if any exist in DB from a previous install
   const existingInstallations = await getInstallationsByUserId(session.user.id);
   if (existingInstallations.length > 0) {
-    redirectUrl.searchParams.set("github", "connected");
+    redirectUrl.searchParams.set("github", "account_connected");
     return NextResponse.redirect(redirectUrl);
   }
 

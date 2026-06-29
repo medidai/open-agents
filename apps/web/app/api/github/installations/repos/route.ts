@@ -2,13 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { getInstallationByUserAndId } from "@/lib/db/installations";
 import { isGitHubAppConfigured } from "@/lib/github/app-auth";
 import {
-  listAppInstallationRepositories,
-  listUserInstallationRepositories,
-} from "@/lib/github/installation-repos";
-import {
   type AppInstallationSummary,
   listAllAppInstallations,
 } from "@/lib/github/installation-resolver";
+import {
+  listAppInstallationRepositories,
+  listUserInstallationRepositories,
+} from "@/lib/github/repos";
 import { getUserGitHubToken } from "@/lib/github/token";
 import { getServerSession } from "@/lib/session/get-server-session";
 

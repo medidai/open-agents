@@ -7,7 +7,8 @@ import {
   isGitHubAppConfigured,
 } from "./app-auth";
 import { getInstallationIdForRepo } from "./installation-resolver";
-import { getGitHubUserProfile, getUserGitHubToken } from "./token";
+import { getUserGitHubToken } from "./token";
+import { getGitHubUserProfile } from "./users";
 
 export type ResolvedGitHubAuth = {
   source: "user" | "app";

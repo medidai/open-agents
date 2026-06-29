@@ -4,10 +4,12 @@ import {
   AlertCircle,
   Ban,
   ChevronDown,
+  ArrowUpRight,
   ExternalLink,
   Globe,
   ListFilter,
   Loader2,
+  Plus,
 } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -29,7 +31,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -40,9 +41,9 @@ import {
 } from "@/components/ui/tooltip";
 import { useGitHubConnectionStatus } from "@/hooks/use-github-connection-status";
 import { useSession } from "@/hooks/use-session";
-import { unlinkGitHub } from "@/lib/github/actions";
+import { unlinkGitHub } from "@/lib/github/actions/connection";
 import { authClient } from "@/lib/auth/client";
-import type { GitHubConnectionReason } from "@/lib/github/connection-status";
+import type { GitHubConnectionReason } from "@/lib/github/status";
 import { fetcher } from "@/lib/swr";
 
 const GITHUB_OAUTH_CALLBACK =
@@ -103,21 +104,19 @@ function startGitHubInstallFromSettings() {
 }
 
 async function startGitHubReconnect(reason: GitHubConnectionReason | null) {
-  // token issues require oauth re-auth directly (not via get-started)
-  if (reason === "token_unavailable" || reason === "sync_auth_failed") {
-    await authClient.linkSocial({
-      provider: "github",
-      callbackURL: GITHUB_OAUTH_CALLBACK,
+  if (reason === "installations_missing") {
+    const params = new URLSearchParams({
+      next: "/settings/connections",
+      reconnect: "1",
     });
+    window.location.href = `/api/github/app/install?${params.toString()}`;
     return;
   }
 
-  // installations_missing — send to app install flow
-  const params = new URLSearchParams({
-    next: "/settings/connections",
-    reconnect: "1",
+  await authClient.linkSocial({
+    provider: "github",
+    callbackURL: GITHUB_OAUTH_CALLBACK,
   });
-  window.location.href = `/api/github/app/install?${params.toString()}`;
 }
 
 function useGitHubReturnToast() {
@@ -135,47 +134,56 @@ function useGitHubReturnToast() {
     window.history.replaceState({}, "", url.toString());
 
     switch (githubParam) {
-      case "connected":
+      case "account_connected":
+        toast.success("GitHub account connected");
+        break;
+      case "app_installed":
         toast.success("GitHub App installed", {
           description:
             "Repository access is now configured for the selected account.",
         });
         break;
+      case "link_failed":
+        toast.error("Failed to connect GitHub account", {
+          description: "Please try again.",
+        });
+        break;
       case "request_sent":
         toast.info("Installation request sent", {
-          description:
-            "An organization admin needs to approve the installation. You will gain access once approved.",
+          description: "An admin needs to approve the installation.",
         });
         break;
       case "no_action":
         toast.info("No changes made", {
-          description:
-            "You returned from GitHub without installing the app. You can install it from the list below.",
+          description: "You returned from GitHub without installing the app.",
         });
         break;
       case "pending_sync":
         if (missingInstallation === "1") {
           toast.info("No new installation detected", {
             description:
-              "You may have returned without selecting an account, or the app is already installed. Check the list below.",
+              "The app may already be installed. Check the list below.",
           });
         } else {
           toast.info("Installation pending", {
-            description:
-              "The installation could not be confirmed yet. It may take a moment to sync.",
+            description: "It may take a moment to sync.",
           });
         }
         break;
       case "app_not_configured":
         toast.error("GitHub App not configured", {
+          description: "Contact the administrator.",
+        });
+        break;
+      case "trial_blocked":
+        toast.error("GitHub connections are disabled", {
           description:
-            "The GitHub App is not set up on this deployment. Contact the administrator.",
+            "In the hosted demo, you can start chats without connecting GitHub.",
         });
         break;
       case "invalid_state":
-        toast.error("GitHub installation callback expired", {
-          description:
-            "Please start the installation again from this page to continue.",
+        toast.error("Callback expired", {
+          description: "Please start the installation again.",
         });
         break;
       default:
@@ -187,24 +195,25 @@ function useGitHubReturnToast() {
 export function AccountsSectionSkeleton() {
   return (
     <div className="rounded-lg border border-border/50 bg-muted/10">
-      <div className="flex items-center justify-between border-b border-border/50 px-4 py-3">
-        <div className="flex items-center gap-3">
-          <Skeleton className="h-5 w-5 rounded" />
-          <Skeleton className="h-4 w-16" />
+      <div className="border-b border-border/50 px-4 py-3">
+        <div className="flex items-center gap-2.5">
+          <GitHubIcon className="h-5 w-5" />
+          <span className="text-sm font-medium">GitHub</span>
         </div>
-        <Skeleton className="h-8 w-24" />
+        <Skeleton className="mt-2 h-3.5 w-64" />
       </div>
-      <div className="p-4">
-        <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
+      <div className="space-y-4 p-4">
+        <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Skeleton className="h-9 w-9 rounded-full" />
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <Skeleton className="h-4 w-24" />
               <Skeleton className="h-3 w-32" />
             </div>
           </div>
-          <Skeleton className="h-8 w-20" />
+          <Skeleton className="h-8 w-24 rounded-md" />
         </div>
+        <Skeleton className="h-4 w-48" />
       </div>
     </div>
   );
@@ -255,7 +264,13 @@ function InstallBadge({
   );
 }
 
-function OrgRow({ org }: { org: OrgInstallStatus }) {
+function OrgRow({
+  org,
+  connectionDisabled,
+}: {
+  org: OrgInstallStatus;
+  connectionDisabled: boolean;
+}) {
   const isInstalled = org.installStatus === "installed";
   const avatarSrc =
     org.avatarUrl ||
@@ -285,6 +300,7 @@ function OrgRow({ org }: { org: OrgInstallStatus }) {
           variant="ghost"
           size="sm"
           className="h-6 px-2 text-[11px]"
+          disabled={connectionDisabled}
           onClick={() => startGitHubInstallForOrg(org.githubId)}
         >
           Install
@@ -326,23 +342,24 @@ function OrgRow({ org }: { org: OrgInstallStatus }) {
 }
 
 /**
- * Connection status dropdown button – mirrors Linear's pattern:
- * • Connected  → green dot, dropdown with Configure + Disconnect
- * • Reconnect  → amber dot, dropdown with Reconnect + Disconnect
- * • Not connected → "Connect →" link-style button
+ * Connection status dropdown button:
+ * • Connected  → green dot, dropdown: manage on github, re-authenticate, disconnect
+ * • Reconnect  → amber dot, dropdown: re-authenticate, disconnect
+ * • Not connected → plain "Connect" button, no dropdown
  */
 function ConnectionStatusButton({
   status,
-  configureUrl,
   onReconnect,
   onDisconnect,
   unlinking,
+  connectionDisabled,
 }: {
   status: "connected" | "reconnect" | "not_connected";
   configureUrl?: string | null;
   onReconnect?: () => void;
   onDisconnect: () => void;
   unlinking: boolean;
+  connectionDisabled: boolean;
 }) {
   if (status === "not_connected") {
     return (
@@ -350,10 +367,11 @@ function ConnectionStatusButton({
         variant="ghost"
         size="sm"
         className="h-8 gap-1 text-xs"
+        disabled={connectionDisabled}
         onClick={startGitHubInstallFromSettings}
       >
         Connect
-        <ExternalLink className="size-3" />
+        <ArrowUpRight className="size-3" />
       </Button>
     );
   }
@@ -361,6 +379,10 @@ function ConnectionStatusButton({
   const isConnected = status === "connected";
   const dotColor = isConnected ? "bg-green-500" : "bg-amber-500";
   const label = isConnected ? "Connected" : "Reconnect";
+  const clientId = process.env.NEXT_PUBLIC_GITHUB_CLIENT_ID;
+  const manageUrl = clientId
+    ? `https://github.com/settings/connections/applications/${clientId}`
+    : null;
 
   return (
     <DropdownMenu>
@@ -371,22 +393,23 @@ function ConnectionStatusButton({
           <ChevronDown className="size-3 text-muted-foreground" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-44">
-        {isConnected && configureUrl ? (
+      <DropdownMenuContent align="end" className="w-48">
+        {isConnected && manageUrl ? (
           <DropdownMenuItem asChild>
-            <Link href={configureUrl} target="_blank" rel="noreferrer">
-              Configure
+            <Link
+              href={manageUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-center justify-between"
+            >
+              Manage on GitHub
+              <ExternalLink className="size-3.5 text-muted-foreground" />
             </Link>
           </DropdownMenuItem>
-        ) : isConnected ? (
-          <DropdownMenuItem onClick={startGitHubInstallFromSettings}>
-            Configure
-          </DropdownMenuItem>
         ) : null}
-        {!isConnected && (
-          <DropdownMenuItem onClick={onReconnect}>Reconnect</DropdownMenuItem>
-        )}
-        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={onReconnect} disabled={connectionDisabled}>
+          Re-authenticate
+        </DropdownMenuItem>
         <DropdownMenuItem
           variant="destructive"
           onClick={onDisconnect}
@@ -401,13 +424,15 @@ function ConnectionStatusButton({
 }
 
 export function AccountsSection() {
-  const { hasGitHubAccount, hasGitHub, loading } = useSession();
+  const { hasGitHubAccount, hasGitHub, loading, session } = useSession();
+  const isTrialUser = session?.isManagedTemplateTrialUser ?? false;
   const { mutate } = useSWRConfig();
   const [unlinking, setUnlinking] = useState(false);
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const {
     reconnectRequired,
     reason,
+    isLoading: connectionStatusLoading,
     refresh: refreshConnectionStatus,
   } = useGitHubConnectionStatus({ enabled: hasGitHub });
 
@@ -467,21 +492,24 @@ export function AccountsSection() {
           <span className="text-sm font-medium">GitHub</span>
         </div>
         <p className="mt-2 text-xs text-muted-foreground">
-          Open Agents uses a GitHub App to access your repositories
+          Connect GitHub to create commits, open pull requests, and manage your
+          repositories
         </p>
       </div>
 
       {/* Body */}
       <div className="space-y-4 p-4">
         {!hasGitHub ? (
-          <NotConnectedState />
-        ) : connectionLoading && !connectionData ? (
+          <NotConnectedState connectionDisabled={isTrialUser} />
+        ) : (connectionLoading || connectionStatusLoading || !connectionData) &&
+          !connectionError ? (
           <ConnectionLoadingSkeleton />
         ) : showDisconnected ? (
           <DisconnectedState
-            onReconnect={() => startGitHubReconnect(reason)}
+            reconnectReason={reason}
             onDisconnect={() => setDisconnectOpen(true)}
             unlinking={unlinking}
+            connectionDisabled={isTrialUser}
           />
         ) : connectionError && !connectionData ? (
           <ConnectionErrorState onRetry={handleRefresh} />
@@ -492,9 +520,10 @@ export function AccountsSection() {
             reconnectReason={reason}
             onDisconnect={() => setDisconnectOpen(true)}
             unlinking={unlinking}
+            connectionDisabled={isTrialUser}
           />
         ) : (
-          <NotConnectedState />
+          <NotConnectedState connectionDisabled={isTrialUser} />
         )}
       </div>
 
@@ -528,20 +557,28 @@ export function AccountsSection() {
   );
 }
 
-function NotConnectedState() {
+function NotConnectedState({
+  connectionDisabled,
+}: {
+  connectionDisabled: boolean;
+}) {
   const [isLinking, setIsLinking] = useState(false);
 
   return (
     <div className="flex items-center justify-between">
       <p className="text-sm text-muted-foreground">
-        Connect your GitHub account to access repositories.
+        {connectionDisabled
+          ? "GitHub connections are disabled in the hosted demo. Deploy your own copy to connect repositories."
+          : "No GitHub account connected"}
       </p>
       <Button
         variant="outline"
         size="sm"
         className="shrink-0 gap-1"
-        disabled={isLinking}
+        disabled={isLinking || connectionDisabled}
         onClick={async () => {
+          if (connectionDisabled) return;
+
           setIsLinking(true);
           await authClient.linkSocial({
             provider: "github",
@@ -549,25 +586,27 @@ function NotConnectedState() {
           });
         }}
       >
+        Connect
         {isLinking ? (
           <Loader2 className="size-3 animate-spin" />
         ) : (
-          <ExternalLink className="size-3" />
+          <ArrowUpRight className="size-3" />
         )}
-        Connect
       </Button>
     </div>
   );
 }
 
 function DisconnectedState({
-  onReconnect,
+  reconnectReason,
   onDisconnect,
   unlinking,
+  connectionDisabled,
 }: {
-  onReconnect: () => void;
+  reconnectReason: GitHubConnectionReason | null;
   onDisconnect: () => void;
   unlinking: boolean;
+  connectionDisabled: boolean;
 }) {
   return (
     <div className="flex items-center justify-between gap-3">
@@ -577,9 +616,10 @@ function DisconnectedState({
       </div>
       <ConnectionStatusButton
         status="reconnect"
-        onReconnect={onReconnect}
+        onReconnect={() => void startGitHubReconnect(reconnectReason)}
         onDisconnect={onDisconnect}
         unlinking={unlinking}
+        connectionDisabled={connectionDisabled}
       />
     </div>
   );
@@ -625,16 +665,32 @@ function ConnectedState({
   reconnectReason,
   onDisconnect,
   unlinking,
+  connectionDisabled,
 }: {
   data: ConnectionStatusResponse;
   reconnectRequired: boolean;
   reconnectReason: GitHubConnectionReason | null;
   onDisconnect: () => void;
   unlinking: boolean;
+  connectionDisabled: boolean;
 }) {
   const [orgsExpanded, setOrgsExpanded] = useState(false);
-  const installedOrgCount = data.orgs.filter(
-    (org) => org.installStatus === "installed",
+
+  // combine personal account + orgs into a single list
+  const allAccounts: OrgInstallStatus[] = [
+    {
+      githubId: data.user.githubId,
+      login: data.user.login,
+      avatarUrl: data.user.avatarUrl,
+      installStatus: data.personalInstallStatus,
+      installationId: null,
+      installationUrl: data.personalInstallationUrl,
+      repositorySelection: data.personalRepositorySelection,
+    },
+    ...data.orgs,
+  ];
+  const installedCount = allAccounts.filter(
+    (a) => a.installStatus === "installed",
   ).length;
 
   return (
@@ -649,20 +705,11 @@ function ConnectedState({
             </AvatarFallback>
           </Avatar>
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <p className="truncate text-sm font-medium">{data.user.login}</p>
-              <InstallBadge
-                status={data.personalInstallStatus}
-                repositorySelection={data.personalRepositorySelection}
-                className="size-3"
-              />
-            </div>
+            <p className="truncate text-sm font-medium">{data.user.login}</p>
             {reconnectRequired ? (
-              <p className="text-xs">
-                <span className="inline-flex items-center gap-1 text-amber-500">
-                  <AlertCircle className="size-3" />
-                  Reconnect required
-                </span>
+              <p className="inline-flex items-center gap-1 text-xs text-amber-500">
+                <AlertCircle className="size-3" />
+                Your GitHub connection has been disconnected.
               </p>
             ) : null}
           </div>
@@ -670,28 +717,15 @@ function ConnectedState({
 
         <ConnectionStatusButton
           status={reconnectRequired ? "reconnect" : "connected"}
-          configureUrl={data.personalInstallationUrl}
-          onReconnect={() => startGitHubReconnect(reconnectReason)}
+          onReconnect={() => void startGitHubReconnect(reconnectReason)}
           onDisconnect={onDisconnect}
           unlinking={unlinking}
+          connectionDisabled={connectionDisabled}
         />
       </div>
 
-      {/* Reconnect banner */}
-      {reconnectRequired ? (
-        <div className="space-y-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-4">
-          <p className="text-sm font-medium text-foreground">
-            Reconnect GitHub to continue
-          </p>
-          <p className="text-sm text-muted-foreground">
-            Your GitHub connection needs to be refreshed. Use the Reconnect
-            option above to restore access.
-          </p>
-        </div>
-      ) : null}
-
-      {/* Org list */}
-      {!reconnectRequired && data.orgs.length > 0 ? (
+      {/* Accounts list */}
+      {!reconnectRequired && allAccounts.length > 0 ? (
         <div className="-mx-4 border-t border-border/50 px-4 pt-3">
           <button
             type="button"
@@ -699,8 +733,8 @@ function ConnectedState({
             className="flex w-full items-center justify-between py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
             <span>
-              Installed in {installedOrgCount}/{data.orgs.length} organization
-              {data.orgs.length !== 1 ? "s" : ""}
+              Installed in {installedCount}/{allAccounts.length} account
+              {allAccounts.length !== 1 ? "s" : ""}
             </span>
             <ChevronDown
               className={`size-3.5 transition-transform ${orgsExpanded ? "rotate-180" : ""}`}
@@ -709,8 +743,12 @@ function ConnectedState({
 
           {orgsExpanded ? (
             <div className="mt-2 space-y-0 divide-y divide-border/30">
-              {data.orgs.map((org) => (
-                <OrgRow key={org.login} org={org} />
+              {allAccounts.map((org) => (
+                <OrgRow
+                  key={org.login}
+                  org={org}
+                  connectionDisabled={connectionDisabled}
+                />
               ))}
 
               <div className="flex items-center py-1.5">
@@ -718,9 +756,11 @@ function ConnectedState({
                   variant="ghost"
                   size="sm"
                   className="h-6 px-2 text-[11px] text-muted-foreground"
+                  disabled={connectionDisabled}
                   onClick={startGitHubInstallFromSettings}
                 >
-                  + Add an organization
+                  <Plus className="size-3.5" />
+                  Add GitHub account
                 </Button>
               </div>
 
@@ -729,13 +769,12 @@ function ConnectedState({
                   <AlertCircle className="mt-0.5 size-4 shrink-0 text-amber-500" />
                   <div>
                     <p className="font-medium text-foreground">
-                      Missing an organization?
+                      Missing an account?
                     </p>
                     <p className="mt-0.5">
-                      If an organization is not listed, you may not have
-                      membership, or the org restricts third-party access. Ask
-                      an org owner to install the GitHub App, or request access
-                      from your organization&apos;s settings page on GitHub.
+                      You may not have membership, or the account restricts
+                      third-party access. Ask an admin to install the GitHub App
+                      from the account&apos;s settings page on GitHub.
                     </p>
                   </div>
                 </div>

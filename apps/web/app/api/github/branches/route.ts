@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchGitHubBranches } from "@/lib/github/api";
 import {
   getInstallationToken,
   isGitHubAppConfigured,
 } from "@/lib/github/app-auth";
 import { getInstallationIdForRepo } from "@/lib/github/installation-resolver";
+import { fetchGitHubBranches } from "@/lib/github/repos";
 import { getUserGitHubToken } from "@/lib/github/token";
 import { getServerSession } from "@/lib/session/get-server-session";
 

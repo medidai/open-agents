@@ -1,4 +1,4 @@
-import type { LanguageModelUsage } from "ai";
+import { isToolUIPart, type LanguageModelUsage, type UIMessageChunk } from "ai";
 import type { SandboxState, Sandbox } from "@open-agents/sandbox";
 import type { WebAgentUIMessage } from "@/app/types";
 import type { AutoCommitResult } from "@/lib/chat/auto-commit-direct";
@@ -132,6 +132,50 @@ export async function persistUserMessage(
   }
 }
 
+export async function persistAssistantMessageWithToolResults(
+  chatId: string,
+  message: WebAgentUIMessage,
+): Promise<void> {
+  "use step";
+
+  if (message.role !== "assistant") {
+    return;
+  }
+
+  const hasToolResults = message.parts.some(
+    (part) =>
+      isToolUIPart(part) &&
+      (part.state === "output-available" ||
+        part.state === "output-error" ||
+        part.state === "approval-responded"),
+  );
+
+  if (!hasToolResults) {
+    return;
+  }
+
+  try {
+    const dedupedMessage = dedupeMessageReasoning(message);
+    const result = await upsertChatMessageScoped({
+      id: dedupedMessage.id,
+      chatId,
+      role: "assistant",
+      parts: dedupedMessage,
+    });
+
+    if (result.status === "conflict") {
+      console.warn(
+        `[workflow] Skipped assistant tool-result upsert due to ID scope conflict: ${message.id}`,
+      );
+    }
+  } catch (error) {
+    console.error(
+      "[workflow] Failed to persist assistant message with tool results:",
+      error,
+    );
+  }
+}
+
 export async function persistAssistantMessage(
   chatId: string,
   message: WebAgentUIMessage,
@@ -250,6 +294,8 @@ export type ClaimActiveStreamResult = "claimed" | "conflict" | "error";
 export async function claimActiveStream(
   chatId: string,
   workflowRunId: string,
+  writable?: WritableStream<UIMessageChunk>,
+  messageId?: string,
 ): Promise<ClaimActiveStreamResult> {
   "use step";
 
@@ -267,10 +313,26 @@ export async function claimActiveStream(
         );
         return "conflict";
       }
+      if (writable && messageId) {
+        const writer = writable.getWriter();
+        try {
+          await writer.write({ type: "start", messageId });
+        } finally {
+          writer.releaseLock();
+        }
+      }
       return "claimed";
     } catch (error) {
       if (attempt === ACTIVE_STREAM_CLAIM_MAX_ATTEMPTS) {
         console.error("[workflow] Failed to claim activeStreamId:", error);
+        if (writable && messageId) {
+          const writer = writable.getWriter();
+          try {
+            await writer.write({ type: "start", messageId });
+          } finally {
+            writer.releaseLock();
+          }
+        }
         // Non-fatal: workflow can still run, just won't be resumable.
         return "error";
       }
@@ -418,6 +480,25 @@ export async function refreshDiffCache(
     await computeAndCacheDiff({ sandbox, sessionId });
   } catch (error) {
     console.error("[workflow] Failed to refresh diff cache:", error);
+  }
+}
+
+export async function closeStream(
+  writable: WritableStream<UIMessageChunk>,
+): Promise<void> {
+  "use step";
+  await writable.close();
+}
+
+export async function sendFinish(
+  writable: WritableStream<UIMessageChunk>,
+): Promise<void> {
+  "use step";
+  const writer = writable.getWriter();
+  try {
+    await writer.write({ type: "finish", finishReason: "stop" });
+  } finally {
+    writer.releaseLock();
   }
 }
 

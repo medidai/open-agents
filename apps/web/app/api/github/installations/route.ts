@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getInstallationsByUserId } from "@/lib/db/installations";
-import { getInstallationManageUrl } from "@/lib/github/installation-url";
 import { listAllAppInstallations } from "@/lib/github/installation-resolver";
+import { getInstallationManageUrl } from "@/lib/github/urls";
 import { getServerSession } from "@/lib/session/get-server-session";
 
 export async function GET() {

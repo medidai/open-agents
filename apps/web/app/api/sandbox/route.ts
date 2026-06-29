@@ -1,15 +1,14 @@
-import { checkBotId } from "botid/server";
 import { connectSandbox, type SandboxState } from "@open-agents/sandbox";
 import {
   requireAuthenticatedUser,
   requireOwnedSession,
   type SessionRecord,
 } from "@/app/api/sessions/_lib/session-context";
-import { botIdConfig } from "@/lib/botid";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { checkBotProtection } from "@/lib/botid";
 import { updateSession } from "@/lib/db/sessions";
-import { parseGitHubUrl } from "@/lib/github/client";
+import { parseGitHubUrl } from "@/lib/github/urls";
 import { resolveGitHubAuth } from "@/lib/github/resolve-token";
+import { getUserGitHubToken } from "@/lib/github/token";
 import {
   installCommitTrailerHook,
   removeCommitTrailerHook,
@@ -32,6 +31,7 @@ import {
   hasResumableSandboxState,
 } from "@/lib/sandbox/utils";
 import { getServerSession } from "@/lib/session/get-server-session";
+import { checkRateLimit, rateLimitKey } from "@/lib/rate-limit";
 // import { buildDevelopmentDotenvFromVercelProject } from "@/lib/vercel/projects";
 // import { getUserVercelToken } from "@/lib/vercel/token";
 
@@ -108,9 +108,18 @@ export async function POST(req: Request) {
     return Response.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  const botVerification = await checkBotId(botIdConfig);
+  const botVerification = await checkBotProtection();
   if (botVerification.isBot) {
     return Response.json({ error: "Access denied" }, { status: 403 });
+  }
+
+  const limited = await checkRateLimit({
+    key: rateLimitKey(["sandbox-create", session.user.id]),
+    limit: 20,
+    windowMs: 60_000,
+  });
+  if (limited) {
+    return limited;
   }
 
   let resolvedAuth: Awaited<ReturnType<typeof resolveGitHubAuth>> = null;
@@ -306,6 +315,20 @@ export async function DELETE(req: Request) {
   const authResult = await requireAuthenticatedUser();
   if (!authResult.ok) {
     return authResult.response;
+  }
+
+  const botVerification = await checkBotProtection();
+  if (botVerification.isBot) {
+    return Response.json({ error: "Access denied" }, { status: 403 });
+  }
+
+  const limited = await checkRateLimit({
+    key: rateLimitKey(["sandbox-delete", authResult.userId]),
+    limit: 10,
+    windowMs: 60_000,
+  });
+  if (limited) {
+    return limited;
   }
 
   let body: unknown;

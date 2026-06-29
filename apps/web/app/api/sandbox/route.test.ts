@@ -47,6 +47,7 @@ interface ConnectConfig {
     persistent?: boolean;
     resume?: boolean;
     createIfMissing?: boolean;
+    timeout?: number;
   };
 }
 
@@ -63,7 +64,6 @@ const dotenvSyncCalls: Array<Record<string, unknown>> = [];
 
 let sessionRecord: TestSessionRecord;
 let currentVercelAuthInfo: TestVercelAuthInfo | null;
-let currentGitHubToken: string | null;
 let currentDotenvContent: string;
 let currentDotenvError: Error | null;
 
@@ -78,12 +78,49 @@ mock.module("@/lib/session/get-server-session", () => ({
   }),
 }));
 
-mock.module("@/lib/github/token", () => ({
-  getGitHubUserProfile: async () => ({
-    externalUserId: "12345",
-    username: "nico-gh",
+mock.module("@/lib/github/urls", () => ({
+  parseGitHubUrl: (repoUrl: string) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(repoUrl);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== "https:" || parsed.hostname !== "github.com") {
+      return null;
+    }
+    const match = parsed.pathname.match(/^\/([^/]+)\/([^/]+?)(\.git)?$/);
+    if (!match?.[1] || !match[2]) {
+      return null;
+    }
+    return { owner: match[1], repo: match[2] };
+  },
+}));
+
+mock.module("@/lib/github/resolve-token", () => ({
+  resolveGitHubAuth: async () => ({
+    source: "user",
+    token: "installation-token-mock",
+    gitUser: {
+      name: "Nico",
+      email: "12345+nico-gh@users.noreply.github.com",
+    },
+    coAuthorTrailer: null,
   }),
-  getUserGitHubToken: async () => currentGitHubToken,
+}));
+
+mock.module("@/lib/github/token", () => ({
+  getUserGitHubToken: async () => "user-token-mock",
+}));
+
+mock.module("@/lib/sandbox/commit-trailer-hook", () => ({
+  installCommitTrailerHook: async () => {},
+  removeCommitTrailerHook: async () => {},
+}));
+
+mock.module("@/lib/rate-limit", () => ({
+  checkRateLimit: async () => null,
+  rateLimitKey: (parts: string[]) => parts.join(":"),
 }));
 
 mock.module("@/lib/vercel/token", () => ({
@@ -118,6 +155,41 @@ mock.module("@/lib/db/sessions", () => ({
 mock.module("@/lib/sandbox/lifecycle-kick", () => ({
   kickSandboxLifecycleWorkflow: (input: KickCall) => {
     kickCalls.push(input);
+  },
+}));
+
+mock.module("@/lib/skills/global-skill-installer", () => ({
+  installGlobalSkills: async (params: {
+    sandbox: {
+      workingDirectory: string;
+      exec: (
+        command: string,
+        cwd: string,
+        timeoutMs: number,
+      ) => Promise<unknown>;
+    };
+    globalSkillRefs: Array<{ source: string; skillName: string }>;
+  }) => {
+    const homeResult = await params.sandbox.exec(
+      'printf %s "$HOME"',
+      params.sandbox.workingDirectory,
+      5000,
+    );
+    const home =
+      typeof homeResult === "object" &&
+      homeResult !== null &&
+      "stdout" in homeResult &&
+      typeof homeResult.stdout === "string"
+        ? homeResult.stdout
+        : "/root";
+
+    for (const ref of params.globalSkillRefs) {
+      await params.sandbox.exec(
+        `HOME='${home}' npx skills add '${ref.source}' --skill '${ref.skillName}' --agent amp -g -y --copy`,
+        params.sandbox.workingDirectory,
+        120000,
+      );
+    }
   },
 }));
 
@@ -156,6 +228,7 @@ mock.module("@open-agents/sandbox", () => ({
       writeFile: async (path: string, content: string) => {
         writeFileCalls.push({ path, content });
       },
+      readFile: async () => null,
       stop: async () => {},
     };
   },
@@ -176,7 +249,6 @@ describe("/api/sandbox lifecycle kicks", () => {
       expiresAt: 1_700_000_000,
       externalId: "user_ext_1",
     };
-    currentGitHubToken = null;
     currentDotenvContent = 'API_KEY="secret"\n';
     currentDotenvError = null;
     sessionRecord = {
@@ -223,6 +295,7 @@ describe("/api/sandbox lifecycle kicks", () => {
         sandboxName: "session_session-1",
       },
       options: {
+        timeout: DEFAULT_SANDBOX_TIMEOUT_MS,
         persistent: true,
         resume: true,
         createIfMissing: true,
@@ -231,10 +304,9 @@ describe("/api/sandbox lifecycle kicks", () => {
     expect(dotenvSyncCalls).toHaveLength(0);
   });
 
-  test("repo sandboxes broker the user GitHub token instead of embedding it", async () => {
+  test("repo sandboxes embed the resolved GitHub token", async () => {
     const { POST } = await routeModulePromise;
 
-    currentGitHubToken = "github-user-token";
     sessionRecord.vercelProjectId = null;
     sessionRecord.vercelProjectName = null;
     sessionRecord.vercelTeamId = null;
@@ -244,6 +316,7 @@ describe("/api/sandbox lifecycle kicks", () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          sessionId: "session-1",
           repoUrl: "https://github.com/acme/private-repo",
           branch: "main",
           sandboxType: "vercel",
@@ -255,16 +328,42 @@ describe("/api/sandbox lifecycle kicks", () => {
     expect(connectConfigs[0]).toMatchObject({
       state: {
         type: "vercel",
+        sandboxName: "session_session-1",
         source: {
           repo: "https://github.com/acme/private-repo",
           branch: "main",
         },
       },
       options: {
-        githubToken: "github-user-token",
+        githubToken: "installation-token-mock",
+        gitUser: {
+          email: "12345+nico-gh@users.noreply.github.com",
+        },
       },
     });
     expect(connectConfigs[0]?.state.source).not.toHaveProperty("token");
+  });
+
+  test("rejects repo URLs that only contain github.com in the path", async () => {
+    const { POST } = await routeModulePromise;
+
+    const response = await POST(
+      new Request("http://localhost/api/sandbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "session-1",
+          repoUrl: "https://attacker.example/github.com/acme/private-repo",
+          branch: "main",
+          sandboxType: "vercel",
+        }),
+      }),
+    );
+
+    const payload = (await response.json()) as { error: string };
+    expect(response.status).toBe(400);
+    expect(payload.error).toBe("Invalid GitHub repository URL");
+    expect(connectConfigs).toHaveLength(0);
   });
 
   test("new vercel sandbox does not sync linked Development env vars while code is commented out", async () => {
@@ -289,9 +388,9 @@ describe("/api/sandbox lifecycle kicks", () => {
       },
     ]);
     expect(updateCalls.length).toBeGreaterThan(0);
-    expect(connectConfigs[0]?.options?.gitUser?.email).toBe(
-      "12345+nico-gh@users.noreply.github.com",
-    );
+    // No repoUrl → no resolved GitHub auth, so the git identity falls back to
+    // the Vercel session user.
+    expect(connectConfigs[0]?.options?.gitUser?.email).toBe("nico@example.com");
     expect(dotenvSyncCalls).toHaveLength(0);
     expect(writeFileCalls).toEqual([]);
 

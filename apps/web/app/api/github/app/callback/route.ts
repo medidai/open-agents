@@ -1,20 +1,11 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { syncUserInstallations } from "@/lib/github/installations-sync";
-import { getUserGitHubToken, getGitHubUsername } from "@/lib/github/token";
+import { syncUserInstallations } from "@/lib/github/sync";
+import { getUserGitHubToken } from "@/lib/github/token";
+import { getGitHubUsername } from "@/lib/github/users";
+import { isManagedTemplateTrialUser } from "@/lib/managed-template-trial";
+import { sanitizeInternalRedirect } from "@/lib/redirect-safety";
 import { getServerSession } from "@/lib/session/get-server-session";
-
-function sanitizeRedirectTo(rawRedirectTo: string | null | undefined): string {
-  if (!rawRedirectTo) {
-    return "/get-started";
-  }
-
-  if (!rawRedirectTo.startsWith("/") || rawRedirectTo.startsWith("//")) {
-    return "/get-started";
-  }
-
-  return rawRedirectTo;
-}
 
 function parseInstallationId(value: string | null): number | null {
   if (!value) {
@@ -43,8 +34,10 @@ function redirectAndClearCookies(url: string | URL): NextResponse {
  */
 export async function GET(req: Request): Promise<Response> {
   const cookieStore = await cookies();
-  const redirectTo = sanitizeRedirectTo(
+  const redirectTo = sanitizeInternalRedirect(
     cookieStore.get("github_app_install_redirect_to")?.value,
+    "/get-started",
+    req.url,
   );
 
   const session = await getServerSession();
@@ -53,6 +46,12 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const redirectUrl = new URL(redirectTo, req.url);
+
+  if (isManagedTemplateTrialUser(session, req.url)) {
+    redirectUrl.searchParams.set("github", "trial_blocked");
+    return redirectAndClearCookies(redirectUrl);
+  }
+
   const requestUrl = new URL(req.url);
   const installationId = parseInstallationId(
     requestUrl.searchParams.get("installation_id"),
@@ -86,7 +85,7 @@ export async function GET(req: Request): Promise<Response> {
   if (setupAction === "request") {
     githubStatus = "request_sent";
   } else if ((syncedInstallationsCount ?? 0) > 0) {
-    githubStatus = "connected";
+    githubStatus = "app_installed";
   } else if (!installationId) {
     githubStatus = "no_action";
     redirectUrl.searchParams.set("missing_installation_id", "1");

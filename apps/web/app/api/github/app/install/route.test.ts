@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { NextRequest } from "next/server";
 
-let authSession: { user: { id: string } } | null;
+let authSession: {
+  authProvider: "vercel";
+  user: { id: string; email?: string };
+} | null;
 let hasLinkedGitHub = false;
 let installations: Array<{ installationId: number }> = [];
 
@@ -16,8 +19,11 @@ mock.module("@/lib/session/get-server-session", () => ({
 }));
 
 mock.module("@/lib/github/token", () => ({
-  hasGitHubAccount: async () => hasLinkedGitHub,
   getUserGitHubToken: async () => (hasLinkedGitHub ? "ghu_test" : null),
+}));
+
+mock.module("@/lib/github/users", () => ({
+  hasGitHubAccount: async () => hasLinkedGitHub,
   getGitHubUsername: async () => (hasLinkedGitHub ? "testuser" : null),
   getGitHubAccountId: async () => (hasLinkedGitHub ? "12345" : null),
 }));
@@ -26,7 +32,7 @@ mock.module("@/lib/db/installations", () => ({
   getInstallationsByUserId: async () => installations,
 }));
 
-mock.module("@/lib/github/installations-sync", () => ({
+mock.module("@/lib/github/sync", () => ({
   syncUserInstallations: async () => installations.length,
 }));
 
@@ -51,7 +57,10 @@ function createRequest(url: string): NextRequest {
 
 describe("GET /api/github/app/install", () => {
   beforeEach(() => {
-    authSession = { user: { id: "user-1" } };
+    authSession = {
+      authProvider: "vercel",
+      user: { id: "user-1", email: "person@vercel.com" },
+    };
     hasLinkedGitHub = true;
     installations = [{ installationId: 1 }];
 
@@ -101,5 +110,26 @@ describe("GET /api/github/app/install", () => {
     const redirectUrl = new URL(location as string);
     expect(redirectUrl.origin).toBe("https://github.com");
     expect(redirectUrl.pathname).toContain("open-agents");
+  });
+
+  test("blocks managed template trial users", async () => {
+    authSession = {
+      authProvider: "vercel",
+      user: { id: "user-1", email: "person@example.com" },
+    };
+    const { GET } = await routeModulePromise;
+
+    const response = await GET(
+      createRequest(
+        "https://open-agents.dev/api/github/app/install?next=/settings/connections",
+      ),
+    );
+
+    expect(response.status).toBe(307);
+    const location = response.headers.get("location");
+    expect(location).toBeTruthy();
+    const redirectUrl = new URL(location as string);
+    expect(redirectUrl.pathname).toBe("/settings/connections");
+    expect(redirectUrl.searchParams.get("github")).toBe("trial_blocked");
   });
 });

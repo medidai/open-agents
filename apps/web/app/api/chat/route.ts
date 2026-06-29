@@ -1,6 +1,9 @@
-import { checkBotId } from "botid/server";
-import { createUIMessageStreamResponse, type InferUIMessageChunk } from "ai";
-import { botIdConfig } from "@/lib/botid";
+import {
+  createUIMessageStreamResponse,
+  generateId,
+  type InferUIMessageChunk,
+} from "ai";
+import { checkBotProtection } from "@/lib/botid";
 import { start } from "workflow/api";
 import type { WebAgentUIMessage } from "@/app/types";
 import {
@@ -9,39 +12,25 @@ import {
   countUserMessagesByUserId,
   createChatMessageIfNotExists,
   getChatById,
-  getChatMessageById,
+  getChatMessageByIdForChat,
   isFirstChatMessage,
   touchChat,
   updateChat,
-  updateSession,
 } from "@/lib/db/sessions";
-import { getUserPreferences } from "@/lib/db/user-preferences";
-import {
-  filterModelVariantsForSession,
-  sanitizeSelectedModelIdForSession,
-  sanitizeUserPreferencesForSession,
-} from "@/lib/model-access";
-import { getAllVariants } from "@/lib/model-variants";
 import { createCancelableReadableStream } from "@/lib/chat/create-cancelable-readable-stream";
-import { assistantFileLinkPrompt } from "@/lib/assistant-file-links";
 import { getServerSession } from "@/lib/session/get-server-session";
 import {
   isManagedTemplateTrialUser,
   MANAGED_TEMPLATE_TRIAL_MESSAGE_LIMIT,
   MANAGED_TEMPLATE_TRIAL_MESSAGE_LIMIT_ERROR,
 } from "@/lib/managed-template-trial";
-import { buildActiveLifecycleUpdate } from "@/lib/sandbox/lifecycle";
 import {
   requireAuthenticatedUser,
   requireOwnedSessionChat,
 } from "./_lib/chat-context";
-import { resolveChatModelSelection } from "./_lib/model-selection";
 import { parseChatRequestBody, requireChatIdentifiers } from "./_lib/request";
-import { createChatRuntime } from "./_lib/runtime";
 import { runAgentWorkflow } from "@/app/workflows/chat";
 import { persistAssistantMessagesWithToolResults } from "./_lib/persist-tool-results";
-
-export const maxDuration = 800;
 
 type WebAgentUIMessageChunk = InferUIMessageChunk<WebAgentUIMessage>;
 
@@ -65,7 +54,7 @@ export async function POST(req: Request) {
   const userId = authResult.userId;
   const session = await getServerSession();
 
-  const botVerification = await checkBotId(botIdConfig);
+  const botVerification = await checkBotProtection();
   if (botVerification.isBot) {
     return Response.json({ error: "Access denied" }, { status: 403 });
   }
@@ -90,23 +79,24 @@ export async function POST(req: Request) {
     sessionId,
     chatId,
     forbiddenMessage: "Unauthorized",
-    requireActiveSandbox: true,
-    sandboxInactiveMessage: "Sandbox not initialized",
   });
   if (!chatContext.ok) {
     return chatContext.response;
   }
 
   const { sessionRecord, chat } = chatContext;
-  const activeSandboxState = sessionRecord.sandboxState;
-  if (!activeSandboxState) {
-    throw new Error("Sandbox not initialized");
+
+  if (sessionRecord.status === "archived") {
+    return Response.json({ error: "Session is archived" }, { status: 400 });
   }
 
   if (isManagedTemplateTrialUser(session, req.url)) {
     const latestUserMessage = getLatestUserMessage(messages);
     if (latestUserMessage) {
-      const existingMessage = await getChatMessageById(latestUserMessage.id);
+      const existingMessage = await getChatMessageByIdForChat(
+        latestUserMessage.id,
+        chatId,
+      );
       if (!existingMessage) {
         const userMessageCount = await countUserMessagesByUserId(userId);
         if (userMessageCount >= MANAGED_TEMPLATE_TRIAL_MESSAGE_LIMIT) {
@@ -143,84 +133,10 @@ export async function POST(req: Request) {
     }
   }
 
-  const requestStartedAt = new Date();
-
-  // Refresh lifecycle activity so long-running responses don't look idle.
-  await updateSession(sessionId, {
-    ...buildActiveLifecycleUpdate(sessionRecord.sandboxState, {
-      activityAt: requestStartedAt,
-    }),
-  });
-
-  // Persist the latest user message immediately (fire-and-forget) so it's
-  // in the DB before the workflow starts. This ensures a page refresh
-  // during workflow queue time still shows the message.
-  void persistLatestUserMessage(chatId, messages);
-
-  // Also persist any assistant messages that contain client-side tool results
-  // (e.g. ask_user_question responses). Without this, tool results are only
-  // persisted when the workflow finishes, so switching devices mid-stream
-  // would lose the tool result.
-  void persistAssistantMessagesWithToolResults(chatId, messages);
-
-  const runtimePromise = createChatRuntime({
-    userId,
-    sessionId,
-    sessionRecord,
-  });
-  const preferencesPromise = getUserPreferences(userId).catch((error) => {
-    console.error("Failed to load user preferences:", error);
-    return null;
-  });
-
-  const [{ sandbox, skills }, rawPreferences] = await Promise.all([
-    runtimePromise,
-    preferencesPromise,
+  await Promise.all([
+    persistLatestUserMessage(chatId, messages),
+    persistAssistantMessagesWithToolResults(chatId, messages),
   ]);
-
-  const preferences = rawPreferences
-    ? sanitizeUserPreferencesForSession(rawPreferences, session, req.url)
-    : null;
-  const modelVariants = filterModelVariantsForSession(
-    getAllVariants(preferences?.modelVariants ?? []),
-    session,
-    req.url,
-  );
-  const selectedModelId =
-    sanitizeSelectedModelIdForSession(
-      chat.modelId,
-      modelVariants,
-      session,
-      req.url,
-    ) ??
-    chat.modelId ??
-    null;
-  const mainModelSelection = resolveChatModelSelection({
-    selectedModelId,
-    modelVariants,
-    missingVariantLabel: "Selected model variant",
-  });
-  const subagentModelSelection = preferences?.defaultSubagentModelId
-    ? resolveChatModelSelection({
-        selectedModelId: sanitizeSelectedModelIdForSession(
-          preferences.defaultSubagentModelId,
-          modelVariants,
-          session,
-          req.url,
-        ),
-        modelVariants,
-        missingVariantLabel: "Subagent model variant",
-      })
-    : undefined;
-
-  // Determine if auto-commit and auto-PR should run after a natural finish.
-  const shouldAutoCommitPush =
-    sessionRecord.autoCommitPushOverride ??
-    preferences?.autoCommitPush ??
-    false;
-  const shouldAutoCreatePr =
-    shouldAutoCommitPush &&
-    (sessionRecord.autoCreatePrOverride ?? preferences?.autoCreatePr ?? false);
 
   // Start the durable workflow
   const run = await start(runAgentWorkflow, [
@@ -229,32 +145,10 @@ export async function POST(req: Request) {
       chatId,
       sessionId,
       userId,
-      selectedModelId: selectedModelId ?? mainModelSelection.id,
-      modelId: mainModelSelection.id,
+      requestUrl: req.url,
+      authSession: session ?? null,
+      assistantId: generateId(),
       maxSteps: 500,
-      agentOptions: {
-        sandbox: {
-          state: activeSandboxState,
-          workingDirectory: sandbox.workingDirectory,
-          currentBranch: sandbox.currentBranch,
-          environmentDetails: sandbox.environmentDetails,
-        },
-        model: mainModelSelection,
-        ...(subagentModelSelection
-          ? { subagentModel: subagentModelSelection }
-          : {}),
-        ...(skills.length > 0 && { skills }),
-        customInstructions: assistantFileLinkPrompt,
-      },
-      ...(shouldAutoCommitPush &&
-        sessionRecord.repoOwner &&
-        sessionRecord.repoName && {
-          autoCommitEnabled: true,
-          autoCreatePrEnabled: shouldAutoCreatePr,
-          sessionTitle: sessionRecord.title,
-          repoOwner: sessionRecord.repoOwner,
-          repoName: sessionRecord.repoName,
-        }),
     },
   ]);
 
@@ -384,13 +278,13 @@ async function persistLatestUserMessage(
       .join(" ")
       .trim();
 
-    if (textContent.length > 0) {
-      const title =
-        textContent.length > 80
-          ? `${textContent.slice(0, 80)}...`
-          : textContent;
-      await updateChat(chatId, { title });
+    if (textContent.length === 0) {
+      return;
     }
+
+    const title =
+      textContent.length > 80 ? `${textContent.slice(0, 80)}...` : textContent;
+    await updateChat(chatId, { title });
   } catch (error) {
     console.error("Failed to persist user message:", error);
   }
