@@ -37,7 +37,7 @@ type MockSessionState = {
 
 const createCalls: Array<Record<string, unknown>> = [];
 const getCalls: Array<Record<string, unknown>> = [];
-const updateNetworkPolicyCalls: Array<Record<string, unknown>> = [];
+const updateNetworkPolicyCalls: Array<Record<string, unknown> | string> = [];
 const runCommandCalls: MockRunCommandParams[] = [];
 const writeFilesCalls: Array<{ path: string; content: Buffer }[]> = [];
 let readFileToBufferResult: Buffer | null = Buffer.from("");
@@ -118,7 +118,7 @@ function createMockSandboxSdk(name: string) {
       lastRunCommandEnv = params.env;
       return runCommandMock(params);
     },
-    updateNetworkPolicy: async (policy: Record<string, unknown>) => {
+    updateNetworkPolicy: async (policy: Record<string, unknown> | string) => {
       updateNetworkPolicyCalls.push(policy);
     },
     writeFiles: async (files: { path: string; content: Buffer }[]) => {
