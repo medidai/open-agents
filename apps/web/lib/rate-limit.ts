@@ -1,5 +1,9 @@
 import Redis, { type RedisOptions } from "ioredis";
-import { getRedisConnectionOptions, getRedisUrl } from "./redis";
+import {
+  getRedisConnectionOptions,
+  getRedisUrl,
+  warnRedisDisabled,
+} from "./redis";
 
 type RateLimitOptions = {
   key: string;
@@ -138,7 +142,12 @@ export async function checkRateLimit(
 ): Promise<Response | null> {
   const redisClient = getSharedRedisClient();
   if (!redisClient) {
-    return rateLimitUnavailableResponse();
+    // Redis is optional infra. When it isn't configured at all, skip rate
+    // limiting rather than failing requests closed (mirrors skills-cache).
+    // Set REDIS_URL/KV_URL to enable enforcement. A configured-but-failing
+    // Redis still fails closed via the catch block below.
+    warnRedisDisabled("rate limiting");
+    return null;
   }
 
   try {

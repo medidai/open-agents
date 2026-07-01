@@ -105,7 +105,7 @@ describe("checkRateLimit", () => {
     expect(response).toBeNull();
   });
 
-  test("fails closed in production when Redis is not configured", async () => {
+  test("skips rate limiting in production when Redis is not configured", async () => {
     delete process.env.REDIS_URL;
     delete process.env.KV_URL;
     process.env[nodeEnvKey] = "production";
@@ -117,8 +117,7 @@ describe("checkRateLimit", () => {
       windowMs: 60_000,
     });
 
-    expect(response?.status).toBe(503);
-    expect(response?.headers.get("Retry-After")).toBe("30");
+    expect(response).toBeNull();
   });
 
   test("allows Redis commands to queue during initial connection", async () => {
