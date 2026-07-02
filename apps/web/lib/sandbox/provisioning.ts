@@ -140,7 +140,7 @@ async function getGitUser(user: UserRecord) {
  * "non-gh users" flow), matching the /api/sandbox route behavior.
  */
 async function getSetupAuth(params: {
-  userId: string;
+  user: UserRecord;
   session: SessionRecord;
 }): Promise<ResolvedGitHubAuth | undefined> {
   if (!params.session.cloneUrl) {
@@ -151,9 +151,16 @@ async function getSetupAuth(params: {
   }
 
   const auth = await resolveGitHubAuth({
-    userId: params.userId,
+    userId: params.user.id,
     owner: params.session.repoOwner,
     repo: params.session.repoName,
+    // Workflow steps run outside a request scope (no session cookie), so
+    // supply the user's identity from the database for git attribution.
+    fallbackIdentity: {
+      name: params.user.name,
+      email: params.user.email,
+      username: params.user.username,
+    },
   });
   if (!auth) {
     throw new Error("Connect GitHub to access repositories");
@@ -227,7 +234,7 @@ export async function provisionSessionSandbox(params: {
   }
 
   const setupAuth = await getSetupAuth({
-    userId: session.userId,
+    user,
     session,
   });
   // When the App is acting for an unlinked user, commit as the bot identity;

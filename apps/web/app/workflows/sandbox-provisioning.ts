@@ -43,6 +43,12 @@ async function runProvisioning(sessionId: string, runId: string) {
     }
 
     const message = error instanceof Error ? error.message : String(error);
+    // Log the underlying error so it is visible in deployment logs — the
+    // workflow platform stores step errors end-to-end encrypted.
+    console.error(
+      `[provisioning] Failed to provision sandbox for session ${sessionId}:`,
+      error,
+    );
     await updateSession(sessionId, {
       lifecycleState: "failed",
       lifecycleError: message,

@@ -23,21 +23,52 @@ export type ResolvedGitHubAuth = {
   coAuthorTrailer: string | null;
 };
 
+/**
+ * Identity fallback for callers that run outside a request scope (e.g.
+ * workflow steps), where no session cookie is available.
+ */
+export interface GitIdentityFallback {
+  name?: string | null;
+  email?: string | null;
+  username?: string | null;
+}
+
 interface VercelUserIdentity {
   name: string;
   email: string;
 }
 
+/**
+ * getServerSession depends on next/headers, which throws outside a request
+ * scope (e.g. inside workflow steps). Treat that as "no session".
+ */
+async function safeGetServerSession() {
+  try {
+    return await getServerSession();
+  } catch {
+    return undefined;
+  }
+}
+
 async function resolveVercelUserIdentity(
   userId: string,
+  fallbackIdentity?: GitIdentityFallback,
 ): Promise<VercelUserIdentity> {
-  const session = await getServerSession();
+  const session = await safeGetServerSession();
   const sessionUser = session?.user?.id === userId ? session.user : undefined;
 
-  const fallbackUsername = sessionUser?.username ?? userId;
-  const name = sessionUser?.name ?? sessionUser?.username ?? "Vercel User";
+  const fallbackUsername =
+    sessionUser?.username ?? fallbackIdentity?.username ?? userId;
+  const name =
+    sessionUser?.name ??
+    sessionUser?.username ??
+    fallbackIdentity?.name ??
+    fallbackIdentity?.username ??
+    "Vercel User";
   const email =
-    sessionUser?.email ?? `${fallbackUsername}@users.noreply.vercel.app`;
+    sessionUser?.email ??
+    fallbackIdentity?.email ??
+    `${fallbackUsername}@users.noreply.vercel.app`;
 
   return { name, email };
 }
@@ -56,13 +87,17 @@ export async function resolveGitHubAuth(params: {
   userId: string;
   owner: string;
   repo: string;
+  /**
+   * Identity to use when no request session is available (workflow steps).
+   */
+  fallbackIdentity?: GitIdentityFallback;
 }): Promise<ResolvedGitHubAuth | null> {
-  const { userId, owner, repo } = params;
+  const { userId, owner, repo, fallbackIdentity } = params;
 
   const userToken = await getUserGitHubToken(userId);
   if (userToken) {
     const ghProfile = await getGitHubUserProfile(userId);
-    const session = await getServerSession();
+    const session = await safeGetServerSession();
     const sessionUser = session?.user?.id === userId ? session.user : undefined;
 
     const noreplyEmail =
@@ -75,11 +110,14 @@ export async function resolveGitHubAuth(params: {
         sessionUser?.name ??
         ghProfile?.username ??
         sessionUser?.username ??
+        fallbackIdentity?.name ??
+        fallbackIdentity?.username ??
         "Vercel User",
       email:
         noreplyEmail ??
         sessionUser?.email ??
-        `${sessionUser?.username ?? userId}@users.noreply.github.com`,
+        fallbackIdentity?.email ??
+        `${sessionUser?.username ?? fallbackIdentity?.username ?? userId}@users.noreply.github.com`,
     };
 
     const botTrailer = await getAppCoAuthorTrailer();
@@ -111,7 +149,7 @@ export async function resolveGitHubAuth(params: {
   const botIdentity = await getBotGitIdentity();
   if (!botIdentity) return null;
 
-  const vercelUser = await resolveVercelUserIdentity(userId);
+  const vercelUser = await resolveVercelUserIdentity(userId, fallbackIdentity);
   const coAuthorTrailer = `Co-authored-by: ${vercelUser.name} <${vercelUser.email}>`;
 
   return {
