@@ -13,21 +13,21 @@ import {
 import { db } from "@/lib/db/client";
 import { users } from "@/lib/db/schema";
 import {
-  verifyRepoAccess,
-  getRepoAccessErrorMessage,
-} from "@/lib/github/access";
-import {
-  mintInstallationToken,
-  revokeInstallationToken,
-  type ScopedInstallationToken,
-} from "@/lib/github/app";
+  resolveGitHubAuth,
+  type ResolvedGitHubAuth,
+} from "@/lib/github/resolve-token";
 import { getGitHubUserProfile } from "@/lib/github/users";
+import {
+  installCommitTrailerHook,
+  removeCommitTrailerHook,
+} from "@/lib/sandbox/commit-trailer-hook";
 import {
   DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
   DEFAULT_SANDBOX_PORTS,
   DEFAULT_SANDBOX_TIMEOUT_MS,
   DEFAULT_SANDBOX_VCPUS,
 } from "@/lib/sandbox/config";
+import { syncEnvSeedToWorkspace } from "@/lib/sandbox/env-seed";
 import {
   buildActiveLifecycleUpdate,
   getNextLifecycleVersion,
@@ -134,10 +134,15 @@ async function getGitUser(user: UserRecord) {
   };
 }
 
-async function getSetupToken(params: {
+/**
+ * Resolve GitHub auth for the session repo. Supports users without a linked
+ * GitHub account by falling back to a GitHub App installation token (the
+ * "non-gh users" flow), matching the /api/sandbox route behavior.
+ */
+async function getSetupAuth(params: {
   userId: string;
   session: SessionRecord;
-}): Promise<ScopedInstallationToken | undefined> {
+}): Promise<ResolvedGitHubAuth | undefined> {
   if (!params.session.cloneUrl) {
     return undefined;
   }
@@ -145,20 +150,16 @@ async function getSetupToken(params: {
     throw new Error("Session is missing repository metadata");
   }
 
-  const access = await verifyRepoAccess({
+  const auth = await resolveGitHubAuth({
     userId: params.userId,
     owner: params.session.repoOwner,
     repo: params.session.repoName,
   });
-  if (!access.ok) {
-    throw new Error(getRepoAccessErrorMessage(access.reason));
+  if (!auth) {
+    throw new Error("Connect GitHub to access repositories");
   }
 
-  return mintInstallationToken({
-    installationId: access.installationId,
-    repositoryIds: [access.repositoryId],
-    permissions: { contents: "read" },
-  });
+  return auth;
 }
 
 async function installSessionGlobalSkills(params: {
@@ -225,33 +226,28 @@ export async function provisionSessionSandbox(params: {
     throw new Error("User not found");
   }
 
-  const gitUser = await getGitUser(user);
-  const setupToken = await getSetupToken({
+  const setupAuth = await getSetupAuth({
     userId: session.userId,
     session,
   });
+  // When the App is acting for an unlinked user, commit as the bot identity;
+  // otherwise attribute commits to the user.
+  const gitUser = setupAuth?.gitUser ?? (await getGitUser(user));
 
-  let sandbox: Sandbox;
-  try {
-    sandbox = await connectSandbox({
-      state: buildSandboxState(session),
-      options: {
-        githubToken: setupToken?.token,
-        gitUser,
-        timeout: DEFAULT_SANDBOX_TIMEOUT_MS,
-        vcpus: DEFAULT_SANDBOX_VCPUS,
-        ports: DEFAULT_SANDBOX_PORTS,
-        baseSnapshotId: DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
-        persistent: true,
-        resume: true,
-        createIfMissing: true,
-      },
-    });
-  } finally {
-    if (setupToken) {
-      await revokeInstallationToken(setupToken.token);
-    }
-  }
+  const sandbox: Sandbox = await connectSandbox({
+    state: buildSandboxState(session),
+    options: {
+      githubToken: setupAuth?.token,
+      gitUser,
+      timeout: DEFAULT_SANDBOX_TIMEOUT_MS,
+      vcpus: DEFAULT_SANDBOX_VCPUS,
+      ports: DEFAULT_SANDBOX_PORTS,
+      baseSnapshotId: DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
+      persistent: true,
+      resume: true,
+      createIfMissing: true,
+    },
+  });
 
   const rawSandboxState = sandbox.getState?.();
   const sandboxState = isSandboxState(rawSandboxState)
@@ -274,11 +270,42 @@ export async function provisionSessionSandbox(params: {
     });
   }
 
+  // Copy the env seed baked into the base snapshot into the working
+  // directory so the dev server gets .env.local (best-effort).
+  try {
+    await syncEnvSeedToWorkspace(sandbox);
+  } catch (error) {
+    console.error(
+      `Failed to sync env seed for session ${params.sessionId}:`,
+      error,
+    );
+  }
+
   await installSessionGlobalSkills({
     session,
     sandbox,
     didSetupWorkspace,
   });
+
+  // When the GitHub App is acting on behalf of an unlinked Vercel user,
+  // install a prepare-commit-msg hook that records the user via a
+  // Co-authored-by trailer. Otherwise ensure the hook is removed (in case
+  // the user just linked their GitHub account on a persistent sandbox).
+  try {
+    if (setupAuth?.source === "app" && setupAuth.coAuthorTrailer) {
+      await installCommitTrailerHook({
+        sandbox,
+        trailer: setupAuth.coAuthorTrailer,
+      });
+    } else {
+      await removeCommitTrailerHook({ sandbox });
+    }
+  } catch (error) {
+    console.error(
+      `Failed to configure commit trailer hook for session ${params.sessionId}:`,
+      error,
+    );
+  }
 
   kickSandboxLifecycleWorkflow({
     sessionId: params.sessionId,

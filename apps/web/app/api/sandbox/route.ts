@@ -18,6 +18,7 @@ import {
   DEFAULT_SANDBOX_PORTS,
   DEFAULT_SANDBOX_TIMEOUT_MS,
 } from "@/lib/sandbox/config";
+import { syncEnvSeedToWorkspace } from "@/lib/sandbox/env-seed";
 import {
   buildActiveLifecycleUpdate,
   getNextLifecycleVersion,
@@ -238,28 +239,7 @@ export async function POST(req: Request) {
       // Copy env seed file from snapshot into the working directory if present.
       // This provides .env.local to the dev server without requiring Vercel
       // project linking (which depends on private-beta API permissions).
-      {
-        let seedContent = await sandbox
-          .readFile("/home/vercel-sandbox/.env.seed", "utf-8")
-          .catch(() => null);
-        if (seedContent && sandbox.domain) {
-          // Replace localhost redirect URIs with the sandbox's public URL.
-          const sandboxOrigin = sandbox.domain(5173).replace(/\/$/, "");
-          seedContent = seedContent.replace(
-            /^(WORKOS_REDIRECT_URI=).*$/m,
-            `$1${sandboxOrigin}/api/auth/callback`,
-          );
-        }
-        if (seedContent) {
-          await sandbox
-            .writeFile(
-              `${sandbox.workingDirectory}/.env.local`,
-              seedContent,
-              "utf-8",
-            )
-            .catch(() => {});
-        }
-      }
+      await syncEnvSeedToWorkspace(sandbox);
 
       try {
         await installSessionGlobalSkills({
