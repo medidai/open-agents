@@ -15,8 +15,8 @@ import {
   withScopedInstallationOctokit,
 } from "@/lib/github/app";
 import {
-  verifyRepoAccess,
   getRepoAccessErrorMessage,
+  verifyRepoAccessWithAppFallback,
 } from "@/lib/github/access";
 import { buildCommitIntentFromSandbox } from "@/lib/github/commit-intent";
 import { createCommit, buildCoAuthor } from "@/lib/github/commit";
@@ -202,7 +202,7 @@ export async function commitChanges(params: {
   }
 
   if (await checkUncommitted(sandbox)) {
-    const access = await verifyRepoAccess({
+    const access = await verifyRepoAccessWithAppFallback({
       userId: session.user.id,
       owner: sessionRecord.repoOwner,
       repo: sessionRecord.repoName,
@@ -248,7 +248,7 @@ export async function commitChanges(params: {
       return { committed: false, pushed: false, branchName: resolvedBranch };
     }
 
-    const access = await verifyRepoAccess({
+    const access = await verifyRepoAccessWithAppFallback({
       userId: session.user.id,
       owner: sessionRecord.repoOwner,
       repo: sessionRecord.repoName,
@@ -308,7 +308,7 @@ export async function commitChanges(params: {
     commitMessage = await generateCommitMessage(diff, sessionTitle);
   }
 
-  const access = await verifyRepoAccess({
+  const access = await verifyRepoAccessWithAppFallback({
     userId: session.user.id,
     owner: sessionRecord.repoOwner,
     repo: sessionRecord.repoName,
@@ -323,7 +323,16 @@ export async function commitChanges(params: {
     };
   }
 
-  const coAuthor = await buildCoAuthor(session.user.id);
+  // For users without a linked GitHub account (App commits as the author),
+  // credit the Vercel user via Co-authored-by using their account identity.
+  const coAuthor =
+    (await buildCoAuthor(session.user.id)) ??
+    (session.user.email
+      ? {
+          name: session.user.name ?? session.user.username,
+          email: session.user.email,
+        }
+      : null);
 
   // build message
   const messageParts = [commitMessage];

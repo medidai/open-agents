@@ -5,6 +5,7 @@ import {
   isGitHubInstallationsAuthError,
   syncUserInstallations,
 } from "@/lib/github/sync";
+import { isGitHubAppConfigured } from "@/lib/github/app-auth";
 import { getUserGitHubToken } from "@/lib/github/token";
 import { getGitHubUsername, hasGitHubAccount } from "@/lib/github/users";
 import { getServerSession } from "@/lib/session/get-server-session";
@@ -27,6 +28,7 @@ export async function GET() {
       reason: null,
       hasInstallations: installations.length > 0,
       syncedInstallationsCount: installations.length,
+      appFallbackAvailable: isGitHubAppConfigured(),
     } satisfies GitHubConnectionStatusResponse);
   }
 

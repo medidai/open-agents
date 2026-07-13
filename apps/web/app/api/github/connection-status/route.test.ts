@@ -16,6 +16,7 @@ let githubUsername: string | null;
 let syncedInstallationsCount = 0;
 let syncError: Error | null;
 let syncErrorIsAuth = false;
+let appConfigured = false;
 
 mock.module("@/lib/session/get-server-session", () => ({
   getServerSession: async () => authSession,
@@ -23,6 +24,10 @@ mock.module("@/lib/session/get-server-session", () => ({
 
 mock.module("@/lib/github/token", () => ({
   getUserGitHubToken: async () => userToken,
+}));
+
+mock.module("@/lib/github/app-auth", () => ({
+  isGitHubAppConfigured: () => appConfigured,
 }));
 
 mock.module("@/lib/github/users", () => ({
@@ -58,6 +63,7 @@ describe("GET /api/github/connection-status", () => {
     syncedInstallationsCount = 1;
     syncError = null;
     syncErrorIsAuth = false;
+    appConfigured = false;
   });
 
   test("returns 401 when unauthenticated", async () => {
@@ -83,6 +89,25 @@ describe("GET /api/github/connection-status", () => {
       reason: null,
       hasInstallations: false,
       syncedInstallationsCount: 0,
+      appFallbackAvailable: false,
+    });
+  });
+
+  test("reports the App fallback for unlinked users when the App is configured", async () => {
+    hasLinkedGitHub = false;
+    installations = [];
+    appConfigured = true;
+    const { GET } = await routeModulePromise;
+
+    const response = await GET();
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      status: "not_connected",
+      reason: null,
+      hasInstallations: false,
+      syncedInstallationsCount: 0,
+      appFallbackAvailable: true,
     });
   });
 

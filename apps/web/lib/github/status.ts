@@ -13,4 +13,10 @@ export interface GitHubConnectionStatusResponse {
   reason: GitHubConnectionReason | null;
   hasInstallations: boolean;
   syncedInstallationsCount: number | null;
+  /**
+   * True when the user has no linked GitHub account but the GitHub App is
+   * configured, so repo operations can fall back to App installation tokens
+   * (the "non-gh users" flow).
+   */
+  appFallbackAvailable?: boolean;
 }

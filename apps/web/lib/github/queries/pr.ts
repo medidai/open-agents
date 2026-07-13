@@ -8,7 +8,7 @@ import {
   type CheckRun,
   type MergeMethod,
 } from "@/lib/github/pulls";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { isSandboxActive } from "@/lib/sandbox/utils";
 import { getServerSession } from "@/lib/session/get-server-session";
 
@@ -169,8 +169,14 @@ export async function checkPullRequest(params: { sessionId: string }): Promise<{
   const currentPrNumber = branchChanged ? null : sessionRecord.prNumber;
   const currentPrStatus = branchChanged ? null : sessionRecord.prStatus;
 
-  // check GitHub for an existing PR on this branch
-  const token = await getUserGitHubToken(session.user.id);
+  // check GitHub for an existing PR on this branch (App-token fallback for
+  // users without a linked GitHub account)
+  const prAuth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: sessionRecord.repoOwner,
+    repo: sessionRecord.repoName,
+  });
+  const token = prAuth?.token;
   if (!token) {
     return {
       branch,
@@ -221,7 +227,11 @@ export async function getMergeReadiness(params: {
       ? `${sessionRecord.repoOwner}/${sessionRecord.repoName}`
       : null;
 
-  if (!sessionRecord.cloneUrl || !repoIdentifier || !sessionRecord.repoOwner) {
+  if (
+    !(sessionRecord.cloneUrl && repoIdentifier) ||
+    !sessionRecord.repoOwner ||
+    !sessionRecord.repoName
+  ) {
     return buildUnavailableResponse(
       "Session is not linked to a GitHub repository",
       sessionRecord.prNumber,
@@ -253,7 +263,12 @@ export async function getMergeReadiness(params: {
     );
   }
 
-  const token = await getUserGitHubToken(session.user.id);
+  const readinessAuth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: sessionRecord.repoOwner,
+    repo: sessionRecord.repoName,
+  });
+  const token = readinessAuth?.token;
   if (!token) {
     return buildUnavailableResponse(
       "No GitHub token available for this repository",

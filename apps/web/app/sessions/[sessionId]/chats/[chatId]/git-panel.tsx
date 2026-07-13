@@ -1699,8 +1699,17 @@ export function GitPanel(props: GitPanelProps) {
     isAgentWorking,
   } = props;
   const { refreshFiles } = useSessionChatWorkspaceContext();
-  const { status: connectionStatus, reconnectRequired } =
-    useGitHubConnectionStatus({ enabled: hasRepo });
+  const {
+    status: rawConnectionStatus,
+    reconnectRequired,
+    appFallbackAvailable,
+  } = useGitHubConnectionStatus({ enabled: hasRepo });
+  // Users without a linked GitHub account can still commit/push/PR through
+  // the GitHub App installation (non-gh users flow) — don't nag them.
+  const connectionStatus =
+    rawConnectionStatus === "not_connected" && appFallbackAvailable
+      ? null
+      : rawConnectionStatus;
   const [baseBranch, setBaseBranch] = useState("main");
   const [discardDialogOpen, setDiscardDialogOpen] = useState(false);
   const [discardTarget, setDiscardTarget] = useState<{

@@ -12,9 +12,11 @@ interface UseGitHubConnectionStatusOptions {
 export function useGitHubConnectionStatus(
   options?: UseGitHubConnectionStatusOptions,
 ) {
-  const { isAuthenticated, hasGitHub } = useSession();
+  const { isAuthenticated } = useSession();
   const enabled = options?.enabled ?? true;
-  const shouldFetch = enabled && isAuthenticated && hasGitHub;
+  // Fetch even without a linked GitHub account: the response tells us whether
+  // the GitHub App fallback (non-gh users flow) is available.
+  const shouldFetch = enabled && isAuthenticated;
 
   const { data, error, isLoading, mutate } =
     useSWR<GitHubConnectionStatusResponse>(
@@ -31,6 +33,7 @@ export function useGitHubConnectionStatus(
     status: data?.status ?? (shouldFetch ? null : "not_connected"),
     reason: data?.reason ?? null,
     hasInstallations: data?.hasInstallations ?? false,
+    appFallbackAvailable: data?.appFallbackAvailable ?? false,
     reconnectRequired: data?.status === "reconnect_required",
     isLoading: shouldFetch && isLoading,
     error: error instanceof Error ? error.message : null,

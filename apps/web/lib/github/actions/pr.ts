@@ -12,12 +12,12 @@ import {
 } from "@/lib/github/pulls";
 import { parseGitHubUrl } from "@/lib/github/client";
 import {
-  verifyRepoAccess,
   getRepoAccessErrorMessage,
+  verifyRepoAccessWithAppFallback,
 } from "@/lib/github/access";
 import { withScopedInstallationOctokit } from "@/lib/github/app";
-import { getGitHubAppUserToken, getUserGitHubToken } from "@/lib/github/token";
 import { generatePullRequestContentFromSandbox } from "@/lib/github/pr-content";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import { getSessionById, updateSession } from "@/lib/db/sessions";
 import { isSandboxActive } from "@/lib/sandbox/utils";
 import { getServerSession } from "@/lib/session/get-server-session";
@@ -337,7 +337,7 @@ export async function openPullRequest(params: {
     });
   }
 
-  const access = await verifyRepoAccess({
+  const access = await verifyRepoAccessWithAppFallback({
     userId: session.user.id,
     owner: parsedRepoUrl.owner,
     repo: parsedRepoUrl.repo,
@@ -357,7 +357,7 @@ export async function openPullRequest(params: {
   let autoMergeAccessError: string | undefined;
 
   if (shouldAutoMerge) {
-    const writeAccess = await verifyRepoAccess({
+    const writeAccess = await verifyRepoAccessWithAppFallback({
       userId: session.user.id,
       owner: parsedRepoUrl.owner,
       repo: parsedRepoUrl.repo,
@@ -371,7 +371,14 @@ export async function openPullRequest(params: {
     }
   }
 
-  const userToken = await getGitHubAppUserToken(session.user.id);
+  // Prefer the user's token (PR authored by them); fall back to a GitHub App
+  // installation token for users without a linked GitHub account.
+  const prAuth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: parsedRepoUrl.owner,
+    repo: parsedRepoUrl.repo,
+  });
+  const userToken = prAuth?.token;
   if (!userToken) {
     throw new Error("No GitHub token available for pull request creation");
   }
@@ -527,12 +534,17 @@ export async function mergePr(params: {
     throw new Error("Invalid merge method");
   }
 
-  const token = await getUserGitHubToken(session.user.id);
+  const mergeAuth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: repoOwner,
+    repo: repoName,
+  });
+  const token = mergeAuth?.token;
   if (!token) {
     throw new Error("No GitHub token available for this repository");
   }
 
-  const access = await verifyRepoAccess({
+  const access = await verifyRepoAccessWithAppFallback({
     userId: session.user.id,
     owner: repoOwner,
     repo: repoName,
@@ -701,7 +713,7 @@ export async function closePr(params: {
     };
   }
 
-  const access = await verifyRepoAccess({
+  const access = await verifyRepoAccessWithAppFallback({
     userId: session.user.id,
     owner: repoOwner,
     repo: repoName,

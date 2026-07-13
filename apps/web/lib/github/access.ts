@@ -1,6 +1,8 @@
 import { getInstallationByAccountLogin } from "@/lib/db/installations";
 import { withScopedInstallationOctokit } from "./app";
+import { getInstallationOctokit, isGitHubAppConfigured } from "./app-auth";
 import { getUserOctokit } from "./client";
+import { getInstallationIdForRepo } from "./installation-resolver";
 
 export type RepoAccessDeniedReason =
   | "no_user_token"
@@ -132,6 +134,65 @@ export async function verifyRepoAccess(params: {
     repositoryId,
     defaultBranch,
   };
+}
+
+/**
+ * verifyRepoAccess with a GitHub App installation fallback for users without
+ * a linked GitHub account (the fork's "non-gh users" flow).
+ *
+ * When the user has no OAuth token or no per-user installation mapping, the
+ * App installation covering the repo defines authorization instead: any
+ * Vercel-authenticated user may operate on repos the App is installed on.
+ * Genuine denials for linked users (user_no_access / user_no_write /
+ * app_no_access) are NOT overridden.
+ */
+export async function verifyRepoAccessWithAppFallback(params: {
+  userId: string;
+  owner: string;
+  repo: string;
+  requiredUserPermission?: RequiredRepoUserPermission;
+}): Promise<RepoAccessResult> {
+  const result = await verifyRepoAccess(params);
+  if (result.ok) {
+    return result;
+  }
+  if (
+    result.reason !== "no_user_token" &&
+    result.reason !== "no_installation"
+  ) {
+    return result;
+  }
+  if (!isGitHubAppConfigured()) {
+    return result;
+  }
+
+  const installationId = await getInstallationIdForRepo({
+    owner: params.owner,
+    repo: params.repo,
+  });
+  if (!installationId) {
+    return result;
+  }
+
+  try {
+    const octokit = getInstallationOctokit(installationId);
+    const repoResponse = await octokit.rest.repos.get({
+      owner: params.owner,
+      repo: params.repo,
+    });
+    return {
+      ok: true,
+      installationId,
+      repositoryId: repoResponse.data.id,
+      defaultBranch: repoResponse.data.default_branch,
+    };
+  } catch (error) {
+    console.error(
+      `App fallback repo access failed for ${params.owner}/${params.repo}:`,
+      error,
+    );
+    return result;
+  }
 }
 
 /**

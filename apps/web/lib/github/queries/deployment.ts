@@ -2,7 +2,7 @@
 
 import { getSessionById } from "@/lib/db/sessions";
 import { findDeploymentUrl } from "@/lib/github/pulls";
-import { getUserGitHubToken } from "@/lib/github/token";
+import { resolveGitHubAuth } from "@/lib/github/resolve-token";
 import {
   findLatestBuildingDeploymentUrlForBranch,
   findLatestFailedDeploymentInspectorUrlForBranch,
@@ -110,7 +110,12 @@ export async function getDeploymentUrl(params: {
     return { deploymentUrl: null };
   }
 
-  const token = await getUserGitHubToken(session.user.id);
+  const deployAuth = await resolveGitHubAuth({
+    userId: session.user.id,
+    owner: sessionRecord.repoOwner,
+    repo: sessionRecord.repoName,
+  });
+  const token = deployAuth?.token;
   if (!token) {
     return { deploymentUrl: null };
   }
