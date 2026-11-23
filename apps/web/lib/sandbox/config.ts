@@ -21,8 +21,8 @@ export const DEFAULT_SANDBOX_TIMEOUT_MS = isHobbyResourceProfile()
   ? HOBBY_SANDBOX_TIMEOUT_MS
   : STANDARD_SANDBOX_TIMEOUT_MS;
 
-/** Default vCPU count for new cloud sandboxes */
-export const DEFAULT_SANDBOX_VCPUS = isHobbyResourceProfile() ? 1 : 4;
+/** Default vCPU count; standard sandboxes need 16 GiB for dev server + typecheck. */
+export const DEFAULT_SANDBOX_VCPUS = isHobbyResourceProfile() ? 1 : 8;
 
 /** Manual extension duration for explicit fallback flows (20 minutes) */
 export const EXTEND_TIMEOUT_DURATION_MS = 20 * 60 * 1000;
